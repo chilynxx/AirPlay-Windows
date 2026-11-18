@@ -135,6 +135,23 @@ jobs:
 
           exit $testCode
 
+      # Export the exact source snapshot used by this successful runner.
+      # git archive includes all tracked project files, including hidden .github files.
+      - name: Package full WWinAirPlay source snapshot
+        if: success()
+        shell: pwsh
+        run: |
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $sourceZip = "WWinAirPlay-source-$shortSha.zip"
+          git archive --format=zip --prefix=WWinAirPlay/ HEAD -o $sourceZip
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $sourceZip)) {
+            throw "Failed to create complete source archive from the checked-out commit."
+          }
+          $sourceHash = (Get-FileHash -LiteralPath $sourceZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$sourceHash  $sourceZip" | Set-Content -Path "$sourceZip.sha256" -Encoding ascii
+          "W_WIN_AIRPLAY_SOURCE_ZIP=$sourceZip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Created full source snapshot: $sourceZip"
+
       # Keep a downloadable Windows test package on successful PR/CI runs.
       # Package only the app and its runtime DLLs (not build tools, PDBs or test EXEs).
       - name: Package WWinAirPlay test build
@@ -174,5 +191,7 @@ jobs:
           path: |
             ${{ env.W_WIN_AIRPLAY_ZIP }}
             ${{ env.W_WIN_AIRPLAY_ZIP }}.sha256
+            ${{ env.W_WIN_AIRPLAY_SOURCE_ZIP }}
+            ${{ env.W_WIN_AIRPLAY_SOURCE_ZIP }}.sha256
           if-no-files-found: error
           retention-days: 30
