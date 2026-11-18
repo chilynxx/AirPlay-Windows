@@ -1,0 +1,177 @@
+name: Release
+
+# Builds the Windows binary on a GitHub-hosted Windows runner and
+# publishes a Windows ZIP and checksum in a GitHub Release.
+#
+# Triggers:
+#   - Push of a tag matching v* (e.g. v0.1.0): creates / updates the
+#     release for that tag with the artifact attached.
+#   - Manual workflow_dispatch from the Actions tab: builds the
+#     binary and uploads it as a workflow artifact only.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed for softprops/action-gh-release
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      # Where vcpkg stores/reads its per-library archives (see the cache steps).
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\vcpkg-binary-cache,readwrite
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The pre-installed vcpkg on windows-latest sits at a recent
+      # commit whose working tree carries port versions that aren't
+      # listed in our manifest's `builtin-baseline` versions/baseline.json.
+      # Clone a fresh vcpkg pinned at our baseline so port versions
+      # and baseline stay in sync. lukka/run-vcpkg caches the clone
+      # and bootstrap output keyed on the commit id.
+      - name: Read vcpkg baseline from manifest
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $baseline = (Get-Content vcpkg.json | ConvertFrom-Json).'builtin-baseline'
+          "baseline=$baseline" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "vcpkg baseline = $baseline"
+
+      - name: Set up pinned vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ steps.vcpkg.outputs.baseline }}
+
+      # Library cache. vcpkg writes one archive per library (FFmpeg, OpenSSL,
+      # SDL2, ...) into vcpkg-binary-cache as soon as that library is built.
+      # The folder is restored here and saved again right after the configure
+      # step *even when a later step fails*, so the ~30 minute library build
+      # happens once instead of on every attempt. (actions/cache's automatic
+      # save only runs when the whole job succeeds, which is why a failed run
+      # used to throw all of that work away.)
+      - name: Restore vcpkg library cache
+        uses: actions/cache/restore@v4
+        with:
+          path: vcpkg-binary-cache
+          key: vcpkg-bin-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            vcpkg-bin-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-bin-${{ runner.os }}-
+
+      - name: Count cached libraries (before)
+        id: cache_before
+        shell: bash
+        run: |
+          mkdir -p vcpkg-binary-cache
+          echo "count=$(( $(find vcpkg-binary-cache -type f | wc -l) ))" >> "$GITHUB_OUTPUT"
+
+      - name: Configure (CMake + vcpkg manifest mode)
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DBUILD_NETWORK_TESTS=ON `
+            -DBUILD_STABILITY_TESTS=ON `
+            -G "Visual Studio 18 2026" -A x64
+
+      - name: Count cached libraries (after)
+        id: cache_after
+        if: always()
+        shell: bash
+        run: |
+          before=${{ steps.cache_before.outputs.count || 0 }}
+          after=$(( $(find vcpkg-binary-cache -type f 2>/dev/null | wc -l) ))
+          echo "libraries cached before=$before after=$after"
+          if [ "$after" -gt "$before" ]; then echo "changed=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Save vcpkg library cache
+        if: always() && steps.cache_after.outputs.changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg-binary-cache
+          key: vcpkg-bin-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+
+      # A manual run is for getting a binary to try: a failing test is shown
+      # as a warning but does not stop the package from being produced.
+      # Tag builds (real releases) still fail on a failing test.
+      - name: Run regression tests
+        continue-on-error: ${{ github.event_name == 'workflow_dispatch' }}
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      # When something fails, keep the library build logs so the cause can be
+      # read (Actions run page -> Artifacts -> build-logs).
+      - name: Upload build logs (only on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build/vcpkg-manifest-install.log
+            build/CMakeFiles/CMakeConfigureLog.yaml
+            ${{ env.VCPKG_ROOT }}/buildtrees/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ([string]::IsNullOrEmpty($tag) -or $tag -eq "main") {
+            $tag = "dev-$($env:GITHUB_SHA.Substring(0,7))"
+          }
+          $zipName = "WWinAirPlay-$tag-x64.zip"
+          $packageDir = Join-Path $env:RUNNER_TEMP "WWinAirPlay-release-$tag"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          Copy-Item -LiteralPath build\Release\WWinAirPlay.exe -Destination $packageDir
+          Get-ChildItem build\Release -Filter *.dll -File | Copy-Item -Destination $packageDir
+          Copy-Item -LiteralPath README.md, LICENSE, THIRD_PARTY_NOTICES.md -Destination $packageDir
+          Copy-Item -LiteralPath docs -Destination $packageDir -Recurse
+          Compress-Archive -Path "$packageDir\*" -DestinationPath $zipName -Force
+          $hash = (Get-FileHash -LiteralPath $zipName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $zipName" | Set-Content -Path "$zipName.sha256" -Encoding ascii
+          "ZIP_PATH=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Get-ChildItem $zipName | Format-List Name, Length
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: |
+            ${{ env.ZIP_PATH }}
+            ${{ env.ZIP_PATH }}.sha256
+          retention-days: 30
+
+      - name: Find release notes
+        id: release_notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $notes = "docs/releases/${{ github.ref_name }}.md"
+          if (Test-Path -LiteralPath $notes) {
+            "path=$notes" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            $title = (Get-Content -LiteralPath $notes -TotalCount 1) -replace '^#\s+', ''
+            "title=$title" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ZIP_PATH }}
+            ${{ env.ZIP_PATH }}.sha256
+          draft: false
+          fail_on_unmatched_files: true
+          body_path: ${{ steps.release_notes.outputs.path }}
+          generate_release_notes: true
+          name: ${{ steps.release_notes.outputs.title || format('AirPlay Windows {0}', github.ref_name) }}

@@ -1,0 +1,180 @@
+name: CI
+
+# Continuous integration build + test. Fires on:
+#   - every pull request (gives reviewers a green/red signal)
+#   - a manual run from the Actions tab
+# It no longer starts on every push to main: in a personal fork each uploaded
+# commit would otherwise start a second full build next to the Release run.
+# Add `push: branches: [main]` under `on:` to get that back.
+# Releases live in release.yml (separate workflow, fires on tag push)
+# so the CI run never produces release artifacts.
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+# Auto-cancel an in-progress CI run if a newer commit lands on the
+# same branch / PR - no point burning runner minutes on stale code.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      # Where vcpkg stores/reads its per-library archives (see the cache steps).
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\vcpkg-binary-cache,readwrite
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read vcpkg baseline from manifest
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $baseline = (Get-Content vcpkg.json | ConvertFrom-Json).'builtin-baseline'
+          "baseline=$baseline" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Set up pinned vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ steps.vcpkg.outputs.baseline }}
+
+      # Library cache. vcpkg writes one archive per library (FFmpeg, OpenSSL,
+      # SDL2, ...) into vcpkg-binary-cache as soon as that library is built.
+      # The folder is restored here and saved again right after the configure
+      # step *even when a later step fails*, so the ~30 minute library build
+      # happens once instead of on every attempt. (actions/cache's automatic
+      # save only runs when the whole job succeeds, which is why a failed run
+      # used to throw all of that work away.)
+      - name: Restore vcpkg library cache
+        uses: actions/cache/restore@v4
+        with:
+          path: vcpkg-binary-cache
+          key: vcpkg-bin-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            vcpkg-bin-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-bin-${{ runner.os }}-
+
+      - name: Count cached libraries (before)
+        id: cache_before
+        shell: bash
+        run: |
+          mkdir -p vcpkg-binary-cache
+          echo "count=$(( $(find vcpkg-binary-cache -type f | wc -l) ))" >> "$GITHUB_OUTPUT"
+
+      - name: Configure (CMake + vcpkg manifest mode)
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DBUILD_NETWORK_TESTS=ON `
+            -DBUILD_STABILITY_TESTS=ON `
+            -G "Visual Studio 18 2026" -A x64
+
+      - name: Count cached libraries (after)
+        id: cache_after
+        if: always()
+        shell: bash
+        run: |
+          before=${{ steps.cache_before.outputs.count || 0 }}
+          after=$(( $(find vcpkg-binary-cache -type f 2>/dev/null | wc -l) ))
+          echo "libraries cached before=$before after=$after"
+          if [ "$after" -gt "$before" ]; then echo "changed=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Save vcpkg library cache
+        if: always() && steps.cache_after.outputs.changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg-binary-cache
+          key: vcpkg-bin-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+
+      # When something fails, keep the library build logs so the cause can be
+      # read (Actions run page -> Artifacts -> build-logs).
+      - name: Upload build logs (only on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build/vcpkg-manifest-install.log
+            build/CMakeFiles/CMakeConfigureLog.yaml
+            ${{ env.VCPKG_ROOT }}/buildtrees/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Run socket lifecycle regression tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      # Python role-plays an iOS client for 6 scenarios (pair-verify
+      # round-trip, real iOS headers, signature corruption, concurrent
+      # sessions, fp-setup framing, legacy ANNOUNCE/SETUP/RECORD/
+      # TEARDOWN). Catches handshake regressions without an iPhone.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Python deps
+        run: pip install cryptography
+
+      # Integration test: the Python harness expects a live AirPlay
+      # server on 127.0.0.1:7000. Start the binary in the background,
+      # poll for the listener, run the test, then teardown. SDL's
+      # dummy drivers keep video / audio init happy on a runner that
+      # has no interactive desktop / audio device.
+      - name: Run pair-verify protocol tests
+        shell: pwsh
+        run: |
+          $env:SDL_VIDEODRIVER = "dummy"
+          $env:SDL_AUDIODRIVER = "dummy"
+          $proc = Start-Process `
+            -FilePath "build\Release\WWinAirPlay.exe" `
+            -ArgumentList "--log" `
+            -WindowStyle Hidden `
+            -PassThru `
+            -RedirectStandardOutput "airplay.stdout.log" `
+            -RedirectStandardError "airplay.stderr.log"
+
+          # Poll the listener for up to 15 s rather than a blind sleep:
+          # vcpkg-built FFmpeg cold-init + SDL sometimes takes 2-3 s
+          # extra on a fresh runner.
+          $ready = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              $c = New-Object System.Net.Sockets.TcpClient
+              $c.Connect("127.0.0.1", 7000)
+              $c.Close()
+              $ready = $true
+              break
+            } catch {
+              Start-Sleep -Milliseconds 500
+            }
+          }
+          if (-not $ready) {
+            Write-Host "::error::AirPlay server never bound :7000 within 15 s"
+          }
+
+          $testCode = 1
+          try {
+            python tools/test_pair_verify.py
+            $testCode = $LASTEXITCODE
+            if ($testCode -eq 0) {
+              python tools/test_connection_loss.py airplay.stderr.log
+              $testCode = $LASTEXITCODE
+            }
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "--- airplay stdout (last 80 lines) ---"
+          if (Test-Path airplay.stdout.log) { Get-Content airplay.stdout.log -Tail 80 }
+          Write-Host "--- airplay stderr (last 80 lines) ---"
+          if (Test-Path airplay.stderr.log) { Get-Content airplay.stderr.log -Tail 80 }
+
+          exit $testCode
