@@ -88,7 +88,7 @@ jobs:
           $zipName = "WWinAirPlay-$tag-x64.zip"
           $packageDir = Join-Path $env:RUNNER_TEMP "WWinAirPlay-release-$tag"
           New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
-          Copy-Item -LiteralPath build\Release\airplay-windows.exe -Destination $packageDir
+          Copy-Item -LiteralPath build\Release\WWinAirPlay.exe -Destination $packageDir
           Get-ChildItem build\Release -Filter *.dll -File | Copy-Item -Destination $packageDir
           Copy-Item -LiteralPath README.md, LICENSE, THIRD_PARTY_NOTICES.md -Destination $packageDir
           Copy-Item -LiteralPath docs -Destination $packageDir -Recurse
