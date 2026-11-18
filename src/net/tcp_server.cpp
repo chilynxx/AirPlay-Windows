@@ -148,7 +148,7 @@ void TcpServer::accept_loop() {
             ? "[" + std::string(ip) + "]:" + std::to_string(peer_port)
             : std::string(ip) + ":" + std::to_string(peer_port);
 
-        LOG_INFO << "accepted " << client.peer;
+        LOG_NOTICE << "accepted " << client.peer;
         const socket_t track_fd = client.fd;
         {
             std::lock_guard<std::mutex> lock(clients_mtx_);

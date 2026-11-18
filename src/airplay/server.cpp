@@ -50,8 +50,11 @@ bool Server::control_audio(MediaCommand command, uint32_t position_ms, const std
 
 void Server::handle_client(ap::net::ClientSocket client) {
     // TCP probes are acknowledged even when media is paused or the screen
-    // is static. An unreachable phone must not retain the session forever.
-    if (!ap::net::enable_tcp_keepalive(client.fd)) {
+    // is static. An unreachable phone must not retain the session forever —
+    // but a Wi-Fi hiccup of a few seconds must not end it either (the old
+    // 5 s / 1 s / 5 probes setting gave up after about ten seconds), so wait
+    // roughly half a minute: 10 s idle + 8 probes, 3 s apart.
+    if (!ap::net::enable_tcp_keepalive(client.fd, 10, 3, 8)) {
         LOG_WARN << "Could not configure control TCP keepalive: "
                  << ap::net::last_error_string();
     }
@@ -92,7 +95,7 @@ void Server::handle_client(ap::net::ClientSocket client) {
         }
         Response res = dispatch(ctx_, session, req);
         remote->update(req.header("dacp-id"), req.header("active-remote"),
-                       session.streams && session.streams->media_control_active(),
+                       session.streams && session.streams->audio_only(),
                        session.streams ? session.streams->session_id() : std::string{});
         if (client.cancelled->load()) break;
         if (res.silent) continue;
@@ -107,7 +110,7 @@ void Server::handle_client(ap::net::ClientSocket client) {
         ReverseChannelRegistry::instance().unregister_socket(
             session.reverse_session_id);
     }
-    LOG_INFO << "control read ended peer=" << client.peer
+    LOG_NOTICE << "control read ended peer=" << client.peer
              << " receiver_cancelled=" << client.cancelled->load()
              << " streams=" << (session.streams ? "yes" : "no");
     // Close the media transports before releasing the control connection.

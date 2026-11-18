@@ -103,6 +103,9 @@ private:
     std::mutex pcm_mutex_;
     std::condition_variable pcm_cv_;
     std::deque<PcmFrame> pcm_queue_;
+    // Written by the playout thread, read by the receive thread's health line.
+    std::atomic<uint64_t> backlog_trimmed_{0};
+    std::atomic<uint64_t> device_reopened_{0};
     std::size_t queued_samples_ = 0;
     uint32_t sync_rtp_ = 0;
     uint64_t sync_ntp_ = 0;

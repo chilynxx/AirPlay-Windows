@@ -1,4 +1,6 @@
 #pragma once
+#include "app_info.h"
+#include "audio/master_volume.h"
 #include "settings.h"
 
 #include <atomic>
@@ -22,8 +24,11 @@ struct LiveSettings {
         return ui_preferences_;
     }
     void set_ui_preferences(const ap::UiPreferences& value) {
-        std::lock_guard<std::mutex> lock(ui_mutex_);
-        ui_preferences_ = value;
+        {
+            std::lock_guard<std::mutex> lock(ui_mutex_);
+            ui_preferences_ = value;
+        }
+        ap::audio::MasterVolume::instance().set(value.master_volume, value.muted);
     }
     std::string receiver_name() const {
         std::lock_guard<std::mutex> lock(name_mutex_);
@@ -70,12 +75,14 @@ struct LiveSettings {
     // Display only: -1 follows the orientation encoded by iOS; 0..3 adds
     // clockwise quarter turns to the received image. Recording is unchanged.
     std::atomic<int> video_rotation{-1};
+    // Seconds of silence from the iPhone before the session is reset (0 = off).
+    std::atomic<int> auto_recover_seconds{8};
 
 private:
     mutable std::mutex ui_mutex_;
     ap::UiPreferences ui_preferences_;
     mutable std::mutex name_mutex_;
-    std::string receiver_name_ = "AirPlay-Windows";
+    std::string receiver_name_ = kAppName;
 };
 
 } // namespace ap::airplay

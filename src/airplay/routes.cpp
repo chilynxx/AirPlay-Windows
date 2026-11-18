@@ -10,6 +10,7 @@
 #include "airplay/sdp.h"
 #include "airplay/streams.h"
 #include "audio/rtp_flush.h"
+#include "audio/volume_memory.h"
 #include "crypto/fairplay.h"
 #include "crypto/pair_verify.h"
 #include "log.h"
@@ -541,7 +542,7 @@ Response handle_teardown(const DeviceContext& ctx, ClientSession& session, const
         // using as a fallback. Stopping the HLS player here killed
         // the just-started video pipeline ~17 ms after it began.
     } else if (session.streams) {
-        LOG_INFO << "TEARDOWN full session=" << session.streams->session_id()
+        LOG_NOTICE << "TEARDOWN full session=" << session.streams->session_id()
                  << " — AirPlay session ended";
         const std::string sid = req.header("x-apple-session-id");
         LOG_INFO << "TEARDOWN: streams.reset() begin";
@@ -575,8 +576,7 @@ Response handle_teardown(const DeviceContext& ctx, ClientSession& session, const
 
 // GET_PARAMETER text/parameters. iOS queries properties of the receiver
 // through this method — currently always "volume\r\n" in mirroring mode.
-// UxPlay returns the current audio volume; since we don't render audio
-// we answer a fixed -144.0 dB (mute) which iOS accepts.
+// We answer with the volume the receiver actually plays at (see VolumeMemory).
 Response handle_get_parameter(const Request& req) {
     Response r = make(200, "OK");
     copy_cseq(req, r);
@@ -586,7 +586,11 @@ Response handle_get_parameter(const Request& req) {
                          req.body.size());
     std::string out;
     if (body_str.find("volume") != std::string::npos) {
-        out = "volume: 0.000000\r\n";
+        // Report the volume we really play at, so the iPhone's slider matches.
+        char line[48];
+        std::snprintf(line, sizeof(line), "volume: %.6f\r\n",
+                      static_cast<double>(ap::audio::VolumeMemory::instance().get()));
+        out = line;
     } else {
         LOG_WARN << "GET_PARAMETER: unknown parameter body=\"" << body_str << '"';
     }
@@ -624,6 +628,7 @@ Response handle_set_parameter(ClientSession& session, const Request& req) {
         if (body_str.compare(0, 7, "volume:") == 0) {
             try {
                 float db = std::stof(body_str.substr(7));
+                ap::audio::VolumeMemory::instance().set(db);
                 if (session.streams) session.streams->set_audio_volume_db(db);
             } catch (...) {
                 LOG_WARN << "SET_PARAMETER: bad volume value";

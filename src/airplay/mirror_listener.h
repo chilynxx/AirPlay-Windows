@@ -6,6 +6,7 @@
 #include "video/video_renderer.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -61,6 +62,20 @@ public:
     // it on the reader thread. The listener does not own the renderer.
     void attach_renderer(ap::video::VideoRenderer* renderer) { renderer_ = renderer; }
 
+    // How long the sender may stay completely silent before the stream is
+    // closed (default 30 s). Adjustable mainly for tests.
+    void set_idle_limit(std::chrono::milliseconds limit) { idle_limit_ms_ = limit.count(); }
+
+    // Interval of the "health:" log line (default 10 s). Adjustable for tests.
+    void set_health_period(std::chrono::milliseconds period) { health_period_ms_ = period.count(); }
+
+    // How long the stream may produce no new picture (while the sender is still
+    // connected) before it is reported in the log (default 20 s). Adjustable for tests.
+    void set_stall_warn(std::chrono::milliseconds first) { stall_warn_ms_ = first.count(); }
+
+    // Pictures decoded so far in this listener's lifetime (diagnostics/tests).
+    uint64_t decoded_frames() const { return decoded_frames_.load(std::memory_order_relaxed); }
+
 private:
     void accept_loop();
     void reader_loop(socket_t client);
@@ -74,6 +89,10 @@ private:
     std::unique_ptr<ap::crypto::MirrorDecrypt> decrypt_;
     std::unique_ptr<ap::video::H264Decoder>    decoder_;
     ap::video::VideoRenderer*                  renderer_{nullptr};
+    std::atomic<int64_t>                       idle_limit_ms_{30'000};
+    std::atomic<int64_t>                       health_period_ms_{10'000};
+    std::atomic<int64_t>                       stall_warn_ms_{20'000};
+    std::atomic<uint64_t>                      decoded_frames_{0};
 };
 
 } // namespace ap::airplay

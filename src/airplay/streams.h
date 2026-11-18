@@ -90,7 +90,6 @@ public:
 
     void teardown();
     bool audio_only() const;
-    bool media_control_active() const { return audio_only() || mirror_ != nullptr; }
 
     const std::string& session_id() const { return session_id_; }
 

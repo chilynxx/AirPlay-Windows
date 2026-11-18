@@ -24,6 +24,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Python for source preflight
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Verify source tree before dependency installation
+        run: python tools/check_sources.py
+
       - name: Read vcpkg baseline from manifest
         id: vcpkg
         shell: pwsh
@@ -50,6 +58,7 @@ jobs:
           cmake -S . -B build `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DBUILD_NETWORK_TESTS=ON `
+            -DBUILD_STABILITY_TESTS=ON `
             -G "Visual Studio 18 2026" -A x64
 
       - name: Build Release

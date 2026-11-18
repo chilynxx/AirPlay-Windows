@@ -1,4 +1,5 @@
 #include "airplay/streams.h"
+#include "audio/volume_memory.h"
 #include "log.h"
 
 #include <cstring>
@@ -40,12 +41,23 @@ uint16_t pick_port(const std::string& header, const char* key) {
 // reaches us over IPv6 it also sends its RTP audio/control packets
 // to the v6 address returned here, and an IPv4-only UDP socket would
 // silently drop those.
+// Windows gives UDP sockets a tiny default receive buffer (64 KB). Audio is
+// about 100 packets a second, so a pause of well under a second in the reader
+// (busy desktop, power saving, Wi-Fi burst after a stall) overflows it and the
+// sound drops out. One mebibyte absorbs several seconds of audio.
+void enlarge_udp_receive_buffer(socket_t s) {
+    int size = 1 << 20;
+    ::setsockopt(s, SOL_SOCKET, SO_RCVBUF,
+                 reinterpret_cast<const char*>(&size), sizeof(size));
+}
+
 std::pair<socket_t, uint16_t> bind_udp() {
     socket_t s = ::socket(AF_INET6, SOCK_DGRAM, 0);
     if (s == INVALID_SOCK) {
         // Kernel without IPv6: fall back to v4-only.
         s = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (s == INVALID_SOCK) return {INVALID_SOCK, 0};
+        enlarge_udp_receive_buffer(s);
 
         sockaddr_in addr{};
         addr.sin_family      = AF_INET;
@@ -67,6 +79,7 @@ std::pair<socket_t, uint16_t> bind_udp() {
         return {s, ntohs(addr.sin_port)};
     }
 
+    enlarge_udp_receive_buffer(s);
     int v6only = 0;
     ::setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY,
                  reinterpret_cast<const char*>(&v6only), sizeof(v6only));
@@ -243,6 +256,11 @@ bool StreamSession::setup_stream(int type,
             // If start() failed before taking ownership, we close the sock here.
             ap::net::close_socket(d_sock);
             audio_.reset();
+        } else {
+            // A new output starts at full volume and the iPhone does not repeat
+            // its volume after leaving and re-entering an app: apply the last
+            // volume it announced.
+            audio_->set_volume_db(ap::audio::VolumeMemory::instance().get());
         }
 
         // AudioReceiver borrows the control socket to read RTP/NTP anchors.
@@ -304,6 +322,7 @@ bool StreamSession::start_ntp(const std::string& remote_ip, uint16_t remote_port
 }
 
 void StreamSession::set_audio_volume_db(float db) {
+    ap::audio::VolumeMemory::instance().set(db);   // also when no audio stream exists yet
     if (audio_) audio_->set_volume_db(db);
 }
 
