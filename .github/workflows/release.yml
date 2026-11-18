@@ -25,6 +25,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Python for source preflight
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Verify source tree before dependency installation
+        run: python tools/check_sources.py
+
       # The pre-installed vcpkg on windows-latest sits at a recent
       # commit whose working tree carries port versions that aren't
       # listed in our manifest's `builtin-baseline` versions/baseline.json.
@@ -61,6 +69,7 @@ jobs:
           cmake -S . -B build `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DBUILD_NETWORK_TESTS=ON `
+            -DBUILD_STABILITY_TESTS=ON `
             -G "Visual Studio 18 2026" -A x64
 
       - name: Build Release
@@ -76,10 +85,10 @@ jobs:
           if ([string]::IsNullOrEmpty($tag) -or $tag -eq "main") {
             $tag = "dev-$($env:GITHUB_SHA.Substring(0,7))"
           }
-          $zipName = "airplay-windows-$tag-x64.zip"
-          $packageDir = Join-Path $env:RUNNER_TEMP "airplay-release-$tag"
+          $zipName = "WWinAirPlay-$tag-x64.zip"
+          $packageDir = Join-Path $env:RUNNER_TEMP "WWinAirPlay-release-$tag"
           New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
-          Copy-Item -LiteralPath build\Release\airplay-windows.exe -Destination $packageDir
+          Copy-Item -LiteralPath build\Release\WWinAirPlay.exe -Destination $packageDir
           Get-ChildItem build\Release -Filter *.dll -File | Copy-Item -Destination $packageDir
           Copy-Item -LiteralPath README.md, LICENSE, THIRD_PARTY_NOTICES.md -Destination $packageDir
           Copy-Item -LiteralPath docs -Destination $packageDir -Recurse
@@ -122,4 +131,4 @@ jobs:
           fail_on_unmatched_files: true
           body_path: ${{ steps.release_notes.outputs.path }}
           generate_release_notes: true
-          name: ${{ steps.release_notes.outputs.title || format('AirPlay Windows {0}', github.ref_name) }}
+          name: ${{ steps.release_notes.outputs.title || format('WWinAirPlay {0}', github.ref_name) }}

@@ -1,4 +1,4 @@
-// AirPlay-Windows — first-skeleton entry point.
+// WWinAirPlay — Windows AirPlay receiver entry point.
 //
 // Responsibilities of main():
 //   1. Initialise Winsock (net::global_init).
@@ -17,6 +17,9 @@
 #include "net/socket.h"
 #include "settings.h"
 #include "platform/single_instance.h"
+#include "app_info.h"
+#include "airplay/link_watchdog.h"
+#include "platform/thread_tuning.h"
 #include "platform/firewall.h"
 #include "usb/usb_supervisor.h"
 #include "video/video_renderer.h"
@@ -26,7 +29,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <deque>
 #include <optional>
 #include <mutex>
 #include <csignal>
@@ -61,7 +63,7 @@ void signal_handler(int) { g_stop = true; }
 // an opt-in experimental path.
 ap::airplay::DeviceContext build_device_context(bool hls_playback) {
     ap::airplay::DeviceContext ctx;
-    ctx.name     = "AirPlay-Windows";
+    ctx.name     = ap::kAppName;
     ctx.deviceid = ap::net::primary_mac();
     ctx.model    = "AppleTV3,2";
     ctx.pi       = "b08f5a79-db29-4384-b456-a4784d9e6055";
@@ -79,8 +81,6 @@ ap::airplay::DeviceContext build_device_context(bool hls_playback) {
 } // namespace
 
 int main(int argc, char** argv) {
-    bool start_hidden = false;
-    for (int i = 1; i < argc; ++i) start_hidden |= std::string(argv[i]) == "--start-hidden";
 #if defined(_WIN32)
     for (int i=1; i<argc; ++i)
         if (std::string(argv[i])=="--configure-firewall") return ap::platform::configure_firewall();
@@ -90,11 +90,11 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i)
         help_only |= std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h";
     if (!help_only) {
-        const auto result = instance.acquire(!start_hidden);
+        const auto result = instance.acquire();
         if (result == ap::platform::SingleInstance::Result::Secondary) return 0;
         if (result == ap::platform::SingleInstance::Result::Error) {
             MessageBoxW(nullptr, L"Unable to initialize the single application instance.",
-                        L"AirPlay-Windows", MB_OK | MB_ICONERROR);
+                        L"WWinAirPlay", MB_OK | MB_ICONERROR);
             return 1;
         }
     }
@@ -124,6 +124,10 @@ int main(int argc, char** argv) {
         freopen_s(&dummy, "CONOUT$", "w", stderr);
     }
 #endif
+
+    // A live mirror needs its threads to wake on time even when the window is
+    // covered or the PC is on battery saver (see thread_tuning.h).
+    ap::platform::disable_process_power_throttling();
 
     auto saved = ap::load_settings();
     if (saved.mirror_width == 0 || saved.mirror_height == 0) {
@@ -190,16 +194,13 @@ int main(int argc, char** argv) {
                              << "), keeping default";
                 }
             }
-        } else if (arg == "--start-hidden") {
-            // Parsed before single-instance activation.
         } else if (arg == "--log" || arg == "--verbose") {
             // Already handled in the pre-init scan above; consume so
             // future unknown-arg paths don't trip on it.
         } else if (arg == "--help" || arg == "-h") {
             std::puts(
-                "AirPlay-Windows [--log] [--hls-proxy-playback]\n"
-                "                [--mirror-res WxH] [--mirror-hwaccel] [--start-hidden]\n"
-                "  --start-hidden        start in the Windows notification area\n"
+                "WWinAirPlay [--log] [--hls-proxy-playback]\n"
+                "                [--mirror-res WxH] [--mirror-hwaccel]\n"
                 "  --log / --verbose     print init/runtime logs to stderr\n"
                 "                        (off by default in the released\n"
                 "                        binary)\n"
@@ -248,6 +249,7 @@ int main(int argc, char** argv) {
     live_settings.fullscreen.store(saved.fullscreen);
     live_settings.chromeless.store(saved.chromeless);
     live_settings.video_rotation.store(saved.video_rotation);
+    live_settings.auto_recover_seconds.store(saved.auto_recover_seconds);
     live_settings.set_ui_preferences(saved.ui);
     ctx.live = &live_settings;
     LOG_INFO << "AirPlay Streaming HLS path: "
@@ -265,7 +267,7 @@ int main(int argc, char** argv) {
     ctx.public_key = identity->public_key();
     ctx.identity   = identity.get();
 
-    LOG_INFO << "=== AirPlay-Windows skeleton ===";
+    LOG_INFO << "=== WWinAirPlay ===";
     LOG_INFO << "name="     << ctx.name;
     LOG_INFO << "deviceid=" << ctx.deviceid;
     const std::string local_ip   = ap::net::primary_ipv4();
@@ -280,7 +282,7 @@ int main(int argc, char** argv) {
     // frames once an iPhone connects.
     ap::video::VideoRenderer renderer;
     renderer.set_live_settings(&live_settings);
-    if (!renderer.start("AirPlay-Windows", start_hidden)) {
+    if (!renderer.start(ap::kAppName)) {
         LOG_WARN << "VideoRenderer could not start — running headless";
     }
     // Prefer the v4 address on the idle screen (shorter, more familiar),
@@ -310,12 +312,12 @@ int main(int argc, char** argv) {
 
     struct AudioRequest { ap::airplay::MediaCommand command; uint32_t position; std::string session_id; };
     std::mutex audio_request_mutex;
-    std::deque<AudioRequest> audio_requests;
+    std::optional<AudioRequest> audio_request;
     renderer.set_audio_control_handler([&](ap::airplay::MediaCommand command, uint32_t position) {
         ap::video::VideoRenderer::DeviceInfo device;
         renderer.active_device_snapshot(device);
         std::lock_guard<std::mutex> lock(audio_request_mutex);
-        audio_requests.push_back({command, position, device.session_id});
+        audio_request = AudioRequest{command, position, device.session_id};
     });
 
     // Local HTTP proxy + libavformat player only when the HLS path is
@@ -348,6 +350,7 @@ int main(int argc, char** argv) {
     auto last_saved_settings = ap::snapshot(live_settings);
     auto observed_settings = last_saved_settings;
     auto settings_changed_at = std::chrono::steady_clock::now();
+    ap::airplay::LinkWatchdog link_watchdog;
     while (!g_stop && !renderer.user_closed()) {
 #if defined(_WIN32)
         if (instance.activation_requested()) renderer.request_show();
@@ -360,6 +363,23 @@ int main(int argc, char** argv) {
             if (!mdns.start(ctx, server.port()))
                 LOG_WARN << "Could not advertise the new receiver name";
         }
+        // A mirror link that has gone completely silent is reset: the old
+        // session is dropped (video and audio buffers are flushed with it) and
+        // the Bonjour advertisement is restarted, so the iPhone can reconnect
+        // immediately instead of facing a receiver stuck on a dead session.
+        if (link_watchdog.poll(renderer.mirror_link_active(), renderer.mirror_last_rx_ns(),
+                               ap::video::VideoRenderer::steady_now_ns(),
+                               live_settings.auto_recover_seconds.load())) {
+            LOG_WARN << "Auto-recovery: no data from the iPhone for more than "
+                     << live_settings.auto_recover_seconds.load()
+                     << " s — resetting the session and restarting Bonjour";
+            server.disconnect_clients();
+            mdns.stop();
+            if (!mdns.start(ctx, server.port()))
+                LOG_WARN << "Auto-recovery: could not restart the Bonjour advertisement";
+            renderer.note_auto_recovery();
+            LOG_NOTICE << "Auto-recovery done: ready for a new connection";
+        }
         if (disconnect_requested.exchange(false)) {
             LOG_INFO << "Disconnect requested by toolbar";
             server.disconnect_clients();
@@ -368,10 +388,7 @@ int main(int argc, char** argv) {
         std::optional<AudioRequest> request;
         {
             std::lock_guard<std::mutex> lock(audio_request_mutex);
-            if (!audio_requests.empty()) {
-                request = std::move(audio_requests.front());
-                audio_requests.pop_front();
-            }
+            request.swap(audio_request);
         }
         if (request) {
             const bool success = server.control_audio(request->command, request->position, request->session_id);

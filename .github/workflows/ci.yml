@@ -24,6 +24,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Python for source preflight
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Verify source tree before dependency installation
+        run: python tools/check_sources.py
+
       - name: Read vcpkg baseline from manifest
         id: vcpkg
         shell: pwsh
@@ -50,6 +58,7 @@ jobs:
           cmake -S . -B build `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DBUILD_NETWORK_TESTS=ON `
+            -DBUILD_STABILITY_TESTS=ON `
             -G "Visual Studio 18 2026" -A x64
 
       - name: Build Release
@@ -81,7 +90,7 @@ jobs:
           $env:SDL_VIDEODRIVER = "dummy"
           $env:SDL_AUDIODRIVER = "dummy"
           $proc = Start-Process `
-            -FilePath "build\Release\airplay-windows.exe" `
+            -FilePath "build\Release\WWinAirPlay.exe" `
             -ArgumentList "--log" `
             -WindowStyle Hidden `
             -PassThru `
@@ -125,3 +134,64 @@ jobs:
           if (Test-Path airplay.stderr.log) { Get-Content airplay.stderr.log -Tail 80 }
 
           exit $testCode
+
+      # Export the exact source snapshot used by this successful runner.
+      # git archive includes all tracked project files, including hidden .github files.
+      - name: Package full WWinAirPlay source snapshot
+        if: success()
+        shell: pwsh
+        run: |
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $sourceZip = "WWinAirPlay-source-$shortSha.zip"
+          git archive --format=zip --prefix=WWinAirPlay/ HEAD -o $sourceZip
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $sourceZip)) {
+            throw "Failed to create complete source archive from the checked-out commit."
+          }
+          $sourceHash = (Get-FileHash -LiteralPath $sourceZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$sourceHash  $sourceZip" | Set-Content -Path "$sourceZip.sha256" -Encoding ascii
+          "W_WIN_AIRPLAY_SOURCE_ZIP=$sourceZip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Created full source snapshot: $sourceZip"
+
+      # Keep a downloadable Windows test package on successful PR/CI runs.
+      # Package only the app and its runtime DLLs (not build tools, PDBs or test EXEs).
+      - name: Package WWinAirPlay test build
+        if: success()
+        shell: pwsh
+        run: |
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $zipName = "WWinAirPlay-test-$shortSha-x64.zip"
+          $packageDir = Join-Path $env:RUNNER_TEMP "WWinAirPlay-test-$shortSha"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+
+          $exe = "build\Release\WWinAirPlay.exe"
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Build output not found: $exe"
+          }
+          Copy-Item -LiteralPath $exe -Destination $packageDir
+
+          $dlls = @(Get-ChildItem build\Release -Filter *.dll -File)
+          foreach ($dll in $dlls) {
+            Copy-Item -LiteralPath $dll.FullName -Destination $packageDir
+          }
+
+          Copy-Item -LiteralPath README.md, LICENSE, THIRD_PARTY_NOTICES.md -Destination $packageDir
+          Copy-Item -LiteralPath docs -Destination $packageDir -Recurse
+          Compress-Archive -Path "$packageDir\*" -DestinationPath $zipName -Force
+
+          $hash = (Get-FileHash -LiteralPath $zipName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $zipName" | Set-Content -Path "$zipName.sha256" -Encoding ascii
+          "W_WIN_AIRPLAY_ZIP=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Packaged $zipName with $($dlls.Count) runtime DLL(s)."
+
+      - name: Upload WWinAirPlay test package
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WWinAirPlay-test-${{ github.sha }}
+          path: |
+            ${{ env.W_WIN_AIRPLAY_ZIP }}
+            ${{ env.W_WIN_AIRPLAY_ZIP }}.sha256
+            ${{ env.W_WIN_AIRPLAY_SOURCE_ZIP }}
+            ${{ env.W_WIN_AIRPLAY_SOURCE_ZIP }}.sha256
+          if-no-files-found: error
+          retention-days: 30

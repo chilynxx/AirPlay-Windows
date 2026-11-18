@@ -2,8 +2,11 @@
 #include "airplay/h264_nal.h"
 #include "airplay/h264_sps.h"
 #include "log.h"
+#include "platform/thread_tuning.h"
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <map>
 #include <sstream>
@@ -31,6 +34,14 @@ namespace {
 constexpr int kHeaderSize       = 128;
 constexpr int kMaxPayloadSize   = 2'000'000;   // generous bound vs RAOP_PACKET_LEN (32 KB)
 constexpr auto kRecvTimeoutMs   = 200;         // per-recv timeout; loops check running_
+
+// (Idle handling: the sender emits something at least once a second even when
+// the screen is static — heartbeat / stream report. Silence for idle_limit_ms_,
+// 30 s by default, means the link is dead, and closing lets the receiver
+// recover instead of showing a frozen picture forever. The limit is generous
+// on purpose: a Wi-Fi stall of several seconds must NOT end the session.)
+// Converted-frame failures in a row (renderer side) before leaving the GPU path.
+constexpr int  kGpuConvertFailuresBeforeFallback = 20;
 
 enum : uint16_t {
     kFrameVideoNonIdr   = 0x0000,
@@ -184,18 +195,31 @@ bool was_timeout() {
 #endif
 }
 
-// Returns len on success, 0 on peer close, -1 on real error.
-// Honours running_ flag by checking between recv calls (SO_RCVTIMEO caps each
-// individual recv at kRecvTimeoutMs).
-template <typename RunningFn>
-int recv_exact(socket_t s, unsigned char* buf, int len, RunningFn running) {
+// Returns len on success, 0 on peer close, -1 on real error or stop request,
+// -2 when `on_timeout()` asks to give up (idle too long).
+// Honours running_ by checking between recv calls (SO_RCVTIMEO caps each
+// individual recv at kRecvTimeoutMs). `last_rx` is refreshed whenever bytes
+// arrive, including partway through a large frame.
+template <typename RunningFn, typename TimeoutFn, typename DataFn>
+int recv_exact(socket_t s, unsigned char* buf, int len, RunningFn running,
+               std::chrono::steady_clock::time_point& last_rx,
+               TimeoutFn on_timeout, DataFn on_data) {
     int got = 0;
     while (got < len) {
         if (!running()) return -1;
         int n = ::recv(s, reinterpret_cast<char*>(buf + got), len - got, 0);
-        if (n > 0) { got += n; continue; }
+        if (n > 0) {
+            got += n;
+            last_rx = std::chrono::steady_clock::now();
+            on_data();
+            continue;
+        }
         if (n == 0) return 0;                 // peer closed
-        if (was_timeout() && running()) continue;
+        if (was_timeout()) {
+            if (!running()) return -1;
+            if (!on_timeout()) return -2;
+            continue;
+        }
         return -1;                             // real error, or stop requested
     }
     return got;
@@ -330,6 +354,7 @@ void MirrorListener::stop() {
 }
 
 void MirrorListener::accept_loop() {
+    ap::platform::raise_current_thread_priority();
     while (running_) {
         fd_set rfds; FD_ZERO(&rfds); FD_SET(listen_sock_, &rfds);
         timeval tv; tv.tv_sec = 0; tv.tv_usec = 100000;
@@ -374,9 +399,14 @@ void MirrorListener::accept_loop() {
             inet_ntop(AF_INET, &in4->sin_addr, ip, sizeof(ip));
             peer_port = ntohs(in4->sin_port);
         }
-        LOG_INFO << "mirror: iOS connected from " << ip << ':' << peer_port;
+        LOG_NOTICE << "mirror: iOS connected from " << ip << ':' << peer_port;
 
         set_recv_timeout(client, kRecvTimeoutMs);
+        // Dead-peer detection at TCP level; kMirrorIdleLimit covers a peer
+        // that is alive but silent. Tolerant values: a few seconds of Wi-Fi
+        // trouble must not end the session.
+        if (!ap::net::enable_tcp_keepalive(client, 10, 3, 6))
+            LOG_WARN << "mirror: could not enable TCP keepalive";
 
         reader_loop(client);
 
@@ -399,9 +429,127 @@ void MirrorListener::reader_loop(socket_t client) {
 
     auto running_fn = [this]() -> bool { return running_.load(); };
 
+    // Tell the application that a stream is connected and when bytes arrive,
+    // so main() can reset a dead link (see airplay/link_watchdog.h).
+    struct LinkGuard {
+        ap::video::VideoRenderer* renderer;
+        ~LinkGuard() { if (renderer) renderer->end_mirror_link(); }
+    } link_guard{renderer_};
+    if (renderer_) renderer_->begin_mirror_link();
+    auto on_data = [this]() { if (renderer_) renderer_->note_mirror_data(); };
+
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point last_rx          = Clock::now();
+    Clock::time_point last_health      = last_rx;
+    uint64_t          health_frames    = 0;
+    uint64_t          health_bytes     = 0;
+    uint64_t          unknown_types    = 0;
+    uint64_t          malformed_frames = 0;
+    uint64_t          prev_decoded     = 0;
+    uint64_t          prev_fed         = 0;
+    // What the sender sent in the current health window, by kind. When a
+    // picture stops, this shows at once whether the iPhone stopped sending
+    // video or the receiver stopped turning it into pictures.
+    uint64_t          win_video = 0, win_idr = 0, win_cfg = 0, win_hb = 0,
+                      win_report = 0, win_other = 0;
+    // Picture-stall tracking (see video_watch below).
+    uint64_t          pics_seen        = 0;
+    Clock::time_point pic_time         = last_rx;
+    bool              pic_stalled      = false;
+    int64_t           next_stall_ms    = 0;
+    uint64_t          since_pic_video  = 0, since_pic_other = 0;
+
+    // One line every few seconds with everything needed to tell, after the
+    // fact, WHICH stage stopped when a session freezes: network, decoder or
+    // display. Called from the receive loop and from its idle timeouts.
+    auto health = [&]() {
+        const auto now = Clock::now();
+        if (now - last_health < std::chrono::milliseconds(health_period_ms_.load())) return;
+        const double secs = std::chrono::duration<double>(now - last_health).count();
+        last_health = now;
+        std::ostringstream os;
+        os << "health: mirror rx " << health_frames << " frames "
+           << (health_bytes / 1024) << " KB in " << static_cast<int>(secs) << " s"
+           << ", last data "
+           << std::chrono::duration_cast<std::chrono::milliseconds>(now - last_rx).count()
+           << " ms ago";
+        if (decoder_) {
+            const auto st = decoder_->stats();
+            os << "; decoder " << (decoder_->using_hardware() ? "GPU" : "CPU")
+               << " frames=" << st.frames << " (+" << (st.frames - prev_decoded) << ')'
+               << " errors=" << st.errors << " resyncs=" << st.resyncs
+               << " skipped=" << st.skipped
+               << " ms avg/max=" << static_cast<int>(st.avg_ms) << '/' << static_cast<int>(st.max_ms);
+            os << " fed=" << (st.packets - prev_fed);
+            prev_decoded = st.frames;
+            prev_fed     = st.packets;
+        }
+        os << "; sender sent video=" << win_video << " (idr=" << win_idr << ")"
+           << " cfg=" << win_cfg << " heartbeat=" << win_hb
+           << " report=" << win_report << " other=" << win_other;
+        if (renderer_) {
+            os << "; display shown=" << renderer_->frames_presented()
+               << " replaced=" << renderer_->frames_replaced()
+               << " gpu_fail=" << renderer_->gpu_convert_failures();
+        }
+        if (malformed_frames) os << "; malformed=" << malformed_frames;
+        LOG_NOTICE << os.str();
+        health_frames = 0;
+        health_bytes  = 0;
+        win_video = win_idr = win_cfg = win_hb = win_report = win_other = 0;
+    };
+
+    // Reports a stream that is connected and alive but shows no new picture.
+    // A static screen does that too, so the message says what the sender
+    // actually sent meanwhile; the first report comes after stall_warn_ms_
+    // (20 s), then after 60 s, 5 min and every 15 min.
+    auto video_watch = [&]() {
+        const auto now = Clock::now();
+        const uint64_t pics = decoded_frames_.load(std::memory_order_relaxed);
+        if (pics != pics_seen) {
+            if (pic_stalled) {
+                LOG_NOTICE << "mirror: pictures resumed after "
+                           << static_cast<int>(std::chrono::duration<double>(now - pic_time).count())
+                           << " s";
+            }
+            pics_seen = pics;
+            pic_time = now;
+            pic_stalled = false;
+            next_stall_ms = 0;
+            since_pic_video = since_pic_other = 0;
+            return;
+        }
+        if (pics == 0) return;   // nothing has been shown yet
+        const int64_t idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - pic_time).count();
+        if (next_stall_ms == 0)
+            next_stall_ms = std::max<int64_t>(1, stall_warn_ms_.load());
+        if (idle_ms >= next_stall_ms) {
+            pic_stalled = true;
+            LOG_WARN << "mirror: no new picture for " << idle_ms / 1000.0
+                     << " s although the sender is connected (video frames received meanwhile: "
+                     << since_pic_video << ", other frames: " << since_pic_other
+                     << "). A static screen does this; otherwise the iPhone stopped sending video.";
+            next_stall_ms = next_stall_ms < 60'000 ? 60'000
+                          : (next_stall_ms < 300'000 ? 300'000 : next_stall_ms + 900'000);
+        }
+    };
+
+    auto on_timeout = [&]() -> bool {
+        health();
+        video_watch();
+        const auto limit = std::chrono::milliseconds(idle_limit_ms_.load());
+        if (Clock::now() - last_rx > limit) {
+            LOG_WARN << "mirror: no data from the sender for "
+                     << limit.count() / 1000.0 << " s — closing the stream";
+            return false;
+        }
+        return true;
+    };
+
     while (running_) {
-        int n = recv_exact(client, header.data(), kHeaderSize, running_fn);
-        if (n == 0) { LOG_INFO << "mirror: iOS closed stream"; break; }
+        int n = recv_exact(client, header.data(), kHeaderSize, running_fn, last_rx, on_timeout, on_data);
+        if (n == 0) { LOG_NOTICE << "mirror: iOS closed stream"; break; }
+        if (n == -2) break;
         if (n < 0)  { LOG_WARN << "mirror: header recv error";  break; }
 
         uint32_t payload_size = get_u32_le(header.data(), 0);
@@ -419,8 +567,9 @@ void MirrorListener::reader_loop(socket_t client) {
         if (payload_size > 0) {
             payload.resize(payload_size);
             n = recv_exact(client, payload.data(),
-                           static_cast<int>(payload_size), running_fn);
+                           static_cast<int>(payload_size), running_fn, last_rx, on_timeout, on_data);
             if (n == 0) { LOG_INFO << "mirror: iOS closed mid-payload"; break; }
+            if (n == -2) break;
             if (n < 0)  { LOG_WARN << "mirror: payload recv error";     break; }
         }
 
@@ -433,10 +582,20 @@ void MirrorListener::reader_loop(socket_t client) {
                 std::chrono::steady_clock::now().time_since_epoch()).count();
 
         ++frames;
+        ++health_frames;
+        health_bytes += kHeaderSize + static_cast<uint64_t>(payload_size);
         total_header += kHeaderSize;
         total_body   += payload_size;
         counts[ftype]++;
         bytes_by_type[ftype] += payload_size;
+        switch (ftype) {
+            case kFrameVideoNonIdr: ++win_video; ++since_pic_video; break;
+            case kFrameVideoIdr:    ++win_video; ++win_idr; ++since_pic_video; break;
+            case kFrameSpsPps:      ++win_cfg;    ++since_pic_other; break;
+            case kFrameHeartbeat:   ++win_hb;     ++since_pic_other; break;
+            case kFrameStreamReport:++win_report; ++since_pic_other; break;
+            default:                ++win_other;  ++since_pic_other; break;
+        }
 
         // Surface the encrypted-frame body byte count to the renderer
         // so the status bar can report a live mirror bandwidth without
@@ -444,6 +603,13 @@ void MirrorListener::reader_loop(socket_t client) {
         if (renderer_) {
             renderer_->record_payload_bytes(
                 kHeaderSize + static_cast<std::size_t>(payload_size));
+        }
+
+        if (ftype != kFrameVideoNonIdr && ftype != kFrameVideoIdr &&
+            ftype != kFrameSpsPps && ftype != kFrameHeartbeat &&
+            ftype != kFrameStreamReport && payload_size > 0 && unknown_types++ < 5) {
+            LOG_WARN << "mirror: unrecognised frame type 0x" << std::hex << ftype
+                     << std::dec << " (" << payload_size << " B) ignored";
         }
 
         // Verbose: first 5 frames regardless of type, plus every IDR/SPS_PPS.
@@ -478,7 +644,9 @@ void MirrorListener::reader_loop(socket_t client) {
         // units while converting to Annex-B (start-code-prefixed).
         const bool encrypted = (ftype == kFrameVideoIdr ||
                                 ftype == kFrameVideoNonIdr);
-        if (encrypted && decrypt_ && payload_size >= 5) {
+        // The AES-CTR keystream is continuous across frames, so EVERY encrypted
+        // frame must pass through the cipher or all later frames turn to noise.
+        if (encrypted && decrypt_ && payload_size > 0) {
             if (!decrypt_->decrypt(payload.data(), static_cast<int>(payload_size))) {
                 LOG_WARN << "mirror: AES-CTR decrypt failed on frame " << frames;
             } else {
@@ -493,6 +661,7 @@ void MirrorListener::reader_loop(socket_t client) {
                     payload.data(), payload_size, nals, nal_codec);
 
                 if (!ok) {
+                    ++malformed_frames;
                     LOG_WARN << "mirror frame[" << frames << "]: malformed NAL "
                                 "stream after decrypt ("
                              << nals.size() << " NAL(s) parsed before stopping)";
@@ -522,7 +691,16 @@ void MirrorListener::reader_loop(socket_t client) {
                         int  dw = 0, dh = 0;
                         decoder_->decode(payload.data(), payload_size, is_idr,
                                          got_frame, dw, dh);
+                        // The display side could not turn GPU surfaces into a
+                        // picture (device lost / driver reset). Decode on the
+                        // CPU instead of leaving the picture frozen.
+                        if (renderer_ && decoder_->using_hardware() &&
+                            renderer_->gpu_convert_failures() >= kGpuConvertFailuresBeforeFallback) {
+                            decoder_->fallback_to_software("GPU frame conversion keeps failing");
+                            renderer_->reset_gpu_convert_failures();
+                        }
                         if (got_frame) {
+                            decoded_frames_.fetch_add(1, std::memory_order_relaxed);
                             if (decoder_->frames_decoded() == 1) {
                                 LOG_INFO << "decoded first frame: "
                                          << dw << 'x' << dh;
@@ -545,13 +723,16 @@ void MirrorListener::reader_loop(socket_t client) {
             }
         }
 
+        health();   // also on busy streams, where recv never times out
+        video_watch();
+
         if ((frames % 500) == 0) {
             LOG_INFO << "mirror progress: " << frames << " frames, "
                      << (total_header + total_body) / 1024 << " KB total";
         }
     }
 
-    LOG_INFO << "mirror stream ended: " << frames << " frames"
+    LOG_NOTICE << "mirror stream ended: " << frames << " frames"
              << ", " << total_body << " payload bytes, per-type:";
     for (const auto& [t, c] : counts) {
         LOG_INFO << "  " << frame_name(t) << " (0x" << std::hex << t << std::dec

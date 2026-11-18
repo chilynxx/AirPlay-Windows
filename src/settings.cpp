@@ -74,6 +74,25 @@ PersistentSettings load_settings(const std::filesystem::path& path) {
                 const int n = std::stoi(val);
                 if (n >= -1 && n <= 3) s.video_rotation = n;
             }
+            else if (key == "auto_recover_seconds") {
+                const int n = std::stoi(val);
+                if (n >= 0 && n <= 120) s.auto_recover_seconds = n;
+            }
+            else if (key == "wallpaper_path") s.ui.wallpaper_path = val;
+            else if (key == "device_frame") s.ui.device_frame = std::stoi(val) != 0;
+            else if (key == "muted") s.ui.muted = std::stoi(val) != 0;
+            else if (key == "master_volume") {
+                const int n = std::stoi(val);
+                if (n >= 0 && n <= 100) s.ui.master_volume = n;
+            }
+            else if (key == "accent") {
+                const int n = std::stoi(val);
+                if (n >= 0 && n <= 3) s.ui.accent = n;
+            }
+            else if (key == "wallpaper_dim") {
+                const int n = std::stoi(val);
+                if (n >= 0 && n <= 90) s.ui.wallpaper_dim = n;
+            }
             else if (key == "diagnostics") s.ui.diagnostics = std::stoi(val) != 0;
             else if (key == "window_placement_valid") s.ui.window_placement_valid = std::stoi(val) != 0;
             else if (key == "window_maximized") s.ui.window_maximized = std::stoi(val) != 0;
@@ -108,6 +127,11 @@ PersistentSettings load_settings(const std::filesystem::path& path) {
             LOG_WARN << "settings: malformed value for " << key << "=" << val;
         }
     }
+    // The product was renamed: an untouched old default follows the new name.
+    if (s.receiver_name == kLegacyReceiverName ||
+        s.receiver_name == kPreviousReceiverName) {
+        s.receiver_name = kAppName;
+    }
     LOG_INFO << "settings: loaded from " << path.u8string();
     return s;
 }
@@ -141,6 +165,13 @@ bool save_settings(const PersistentSettings& s, const std::filesystem::path& pat
         << "fullscreen="     << s.fullscreen     << '\n'
         << "chromeless="     << s.chromeless     << '\n'
         << "video_rotation=" << s.video_rotation << '\n'
+        << "auto_recover_seconds=" << s.auto_recover_seconds << '\n'
+        << "wallpaper_path=" << s.ui.wallpaper_path << '\n'
+        << "wallpaper_dim=" << s.ui.wallpaper_dim << '\n'
+        << "accent=" << s.ui.accent << '\n'
+        << "device_frame=" << (s.ui.device_frame ? 1 : 0) << '\n'
+        << "master_volume=" << s.ui.master_volume << '\n'
+        << "muted=" << (s.ui.muted ? 1 : 0) << '\n'
         << "diagnostics=" << s.ui.diagnostics << '\n'
         << "window_placement_valid=" << s.ui.window_placement_valid << '\n'
         << "window_x=" << s.ui.window_x << '\n'
@@ -184,6 +215,7 @@ PersistentSettings snapshot(const ap::airplay::LiveSettings& live) {
     s.fullscreen     = live.fullscreen.load(std::memory_order_relaxed);
     s.chromeless     = live.chromeless.load(std::memory_order_relaxed);
     s.video_rotation = live.video_rotation.load(std::memory_order_relaxed);
+    s.auto_recover_seconds = live.auto_recover_seconds.load(std::memory_order_relaxed);
     s.ui = live.ui_preferences();
     return s;
 }
