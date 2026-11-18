@@ -1,8 +1,11 @@
 #include "video/h264_decoder.h"
 #include "log.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 
 extern "C" {
     #include <libavcodec/avcodec.h>
@@ -17,6 +20,32 @@ namespace {
 
 constexpr uint8_t kStartCode[4] = { 0x00, 0x00, 0x00, 0x01 };
 
+// ---- recovery policy ---------------------------------------------------------
+// After this many failed calls in a row, flush the decoder and wait for a key
+// frame instead of feeding it more data it cannot use.
+constexpr int kErrorsBeforeResync = 6;
+// Packets fed without a single picture coming out: the decoder is stuck.
+constexpr int kPacketsWithoutFrame = 120;
+// While waiting for an IDR, inter frames are skipped for at most this long.
+constexpr auto kMaxIdrWait = std::chrono::milliseconds(1500);
+// Three resyncs within a minute: the decoder itself is broken, escalate.
+constexpr auto kEscalateWindow = std::chrono::seconds(60);
+constexpr std::size_t kEscalateCount = 3;
+// GPU decode slower than this for this many frames in a row: use the CPU.
+constexpr double kSlowGpuDecodeMs = 60.0;
+constexpr int    kSlowGpuStreak   = 30;
+// A GPU that failed twice recently is not trusted again for a while.
+constexpr int    kDistrustFailures = 2;
+constexpr auto   kDistrustDuration = std::chrono::minutes(30);
+
+std::atomic<int>     g_hw_failures{0};
+std::atomic<int64_t> g_last_hw_failure_ns{0};
+
+int64_t steady_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void append_annexb_nal(std::vector<uint8_t>& dst,
                        const uint8_t* nal, std::size_t size) {
     dst.insert(dst.end(), kStartCode, kStartCode + 4);
@@ -30,6 +59,7 @@ struct H264Decoder::Impl {
     AVCodecContext*      ctx         = nullptr;
     AVPacket*            pkt         = nullptr;
     AVFrame*             frame       = nullptr;
+    AVFrame*             tmp_frame   = nullptr;   // receive target, see drain()
     SwsContext*          sws         = nullptr;
 
     // Annex-B bytes (with leading 00 00 00 01 start code) cached from
@@ -63,8 +93,50 @@ struct H264Decoder::Impl {
     bool                 frame_is_hw       = false;
     HwBackend            backend           = HwBackend::None;
 
+    // ---- health / recovery state -------------------------------------------
+    uint64_t packets_in = 0, errors = 0, skipped = 0, resyncs = 0;
+    int      consecutive_errors   = 0;
+    int      packets_without_frame = 0;
+    int      slow_streak          = 0;
+    double   last_ms = 0, avg_ms = 0, max_ms = 0;
+    bool     wait_idr     = true;   // nothing useful can be decoded before an IDR
+    bool     wait_started = false;
+    std::chrono::steady_clock::time_point wait_since{};
+    std::deque<std::chrono::steady_clock::time_point> recent_resyncs;
+    uint64_t error_logs = 0;
+
+    void begin_wait_for_idr() {
+        wait_idr = true;
+        wait_started = false;
+        consecutive_errors = 0;
+        packets_without_frame = 0;
+        slow_streak = 0;
+    }
+
+    // Pull every picture libavcodec has ready and keep the newest one in
+    // `frame`. Returns true when at least one picture was produced; `err`
+    // receives the first hard error (0 when none).
+    bool drain(int& err) {
+        bool any = false;
+        err = 0;
+        for (;;) {
+            const int r = avcodec_receive_frame(ctx, tmp_frame);
+            if (r == 0) {
+                av_frame_unref(frame);
+                av_frame_move_ref(frame, tmp_frame);
+                ++frames_out;
+                any = true;
+                continue;
+            }
+            if (r != AVERROR(EAGAIN) && r != AVERROR_EOF) err = r;
+            break;
+        }
+        return any;
+    }
+
     ~Impl() {
         if (sws)              sws_freeContext(sws);
+        if (tmp_frame)        av_frame_free(&tmp_frame);
         if (frame)            av_frame_free(&frame);
         if (pkt)              av_packet_free(&pkt);
         if (ctx)              avcodec_free_context(&ctx);
@@ -193,7 +265,7 @@ struct H264Decoder::Impl {
             (ctx->active_thread_type ==
                 (FF_THREAD_SLICE | FF_THREAD_FRAME))     ? "slice+frame" :
                                                             "none";
-        LOG_INFO << "decoder ready: " << avcodec_get_name(id)
+        LOG_NOTICE << "decoder ready: " << avcodec_get_name(id)
                  << " via " << (c->name ? c->name : "?")
                  << " (libavcodec " << LIBAVCODEC_IDENT << ") "
                  << tag << " [LOW_DELAY]"
@@ -209,7 +281,13 @@ H264Decoder::~H264Decoder() = default;
 bool H264Decoder::init(bool hwaccel, AVBufferRef* render_device) {
     impl_->pkt = av_packet_alloc();
     impl_->frame = av_frame_alloc();
-    if (!impl_->pkt || !impl_->frame) return false;
+    impl_->tmp_frame = av_frame_alloc();
+    if (!impl_->pkt || !impl_->frame || !impl_->tmp_frame) return false;
+    if (hwaccel && hardware_distrusted()) {
+        LOG_WARN << "decoder: GPU decoding failed recently in this process — "
+                    "starting in software mode";
+        hwaccel = false;
+    }
     // Direct rendering requires the GPU pipeline's D3D11 decode device.
     impl_->hwaccel_requested = hwaccel && render_device;
     if (impl_->hwaccel_requested)
@@ -415,77 +493,199 @@ bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
                          bool& got_frame, int& width, int& height) {
     got_frame = false;
     width = height = 0;
-    if (!impl_->ctx) return false;
+    auto& im = *impl_;
+    if (!im.ctx) return false;
     if (!nal_data || nal_size == 0) return false;
+
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::now();
+
+    // At the start and after a resync, inter frames cannot be decoded. Skip
+    // them, but only for a short time: a sender that rarely sends IDRs must
+    // not leave the picture frozen.
+    if (im.wait_idr && !is_idr) {
+        if (!im.wait_started) { im.wait_started = true; im.wait_since = t0; }
+        if (t0 - im.wait_since < kMaxIdrWait) { ++im.skipped; return true; }
+        LOG_WARN << "decoder: no IDR within " << kMaxIdrWait.count()
+                 << " ms — decoding inter frames anyway";
+        im.wait_idr = false;
+    }
+    if (is_idr) { im.wait_idr = false; im.wait_started = false; }
 
     // Build the Annex-B packet in the per-decoder scratch buffer.
     // clear() preserves capacity — after the first IDR (which sets
     // the peak size) the vector never reallocates again, so each
     // subsequent frame is heap-jitter-free.
-    auto& buf = impl_->packet_scratch;
+    auto& buf = im.packet_scratch;
     buf.clear();
     const std::size_t header_bytes = is_idr
-        ? (impl_->vps_annexb.size() + impl_->sps_annexb.size() +
-           impl_->pps_annexb.size())
+        ? (im.vps_annexb.size() + im.sps_annexb.size() + im.pps_annexb.size())
         : 0;
     if (buf.capacity() < nal_size + header_bytes) {
         buf.reserve(nal_size + header_bytes);
     }
     if (is_idr) {
-        if (!impl_->vps_annexb.empty()) {
-            buf.insert(buf.end(),
-                       impl_->vps_annexb.begin(), impl_->vps_annexb.end());
-        }
-        buf.insert(buf.end(),
-                   impl_->sps_annexb.begin(), impl_->sps_annexb.end());
-        buf.insert(buf.end(),
-                   impl_->pps_annexb.begin(), impl_->pps_annexb.end());
+        if (!im.vps_annexb.empty())
+            buf.insert(buf.end(), im.vps_annexb.begin(), im.vps_annexb.end());
+        buf.insert(buf.end(), im.sps_annexb.begin(), im.sps_annexb.end());
+        buf.insert(buf.end(), im.pps_annexb.begin(), im.pps_annexb.end());
     }
     buf.insert(buf.end(), nal_data, nal_data + nal_size);
 
-    av_packet_unref(impl_->pkt);
-    impl_->pkt->data = buf.data();
-    impl_->pkt->size = static_cast<int>(buf.size());
+    av_packet_unref(im.pkt);
+    im.pkt->data = buf.data();
+    im.pkt->size = static_cast<int>(buf.size());
+    ++im.packets_in;
+    ++im.packets_without_frame;
 
-    int ret = avcodec_send_packet(impl_->ctx, impl_->pkt);
-    if (ret < 0 && ret != AVERROR(EAGAIN)) {
-        char err[AV_ERROR_MAX_STRING_SIZE]{};
-        av_strerror(ret, err, sizeof(err));
-        LOG_WARN << "H264Decoder: send_packet error " << err;
-        return false;
+    int  hard_error = 0;
+    bool got = false;
+    int  ret = avcodec_send_packet(im.ctx, im.pkt);
+    if (ret == AVERROR(EAGAIN)) {
+        // The decoder wants its output taken before it accepts more input.
+        int err = 0;
+        got = im.drain(err);
+        if (err) hard_error = err;
+        ret = avcodec_send_packet(im.ctx, im.pkt);
+    }
+    if (ret < 0) hard_error = ret;
+    {
+        int err = 0;
+        if (im.drain(err)) got = true;
+        if (err && !hard_error) hard_error = err;
     }
 
-    ret = avcodec_receive_frame(impl_->ctx, impl_->frame);
-    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) return true;
-    if (ret < 0) {
-        char err[AV_ERROR_MAX_STRING_SIZE]{};
-        av_strerror(ret, err, sizeof(err));
-        LOG_WARN << "H264Decoder: receive_frame error " << err;
-        return false;
+    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    im.last_ms = ms;
+    im.avg_ms  = im.avg_ms <= 0 ? ms : im.avg_ms * 0.9 + ms * 0.1;
+    if (ms > im.max_ms) im.max_ms = ms;
+
+    if (got) {
+        const AVFrame* f = im.frame;
+        width   = f->width;
+        height  = f->height;
+        im.last_w = width;
+        im.last_h = height;
+        // Hardware output carries a frame-pool reference; software output does not.
+        im.frame_is_hw = (f->hw_frames_ctx != nullptr);
+        // GPU surfaces stay resident until presentation. Pixel planes are only
+        // accessed for software output; no staging texture or CPU readback.
+        im.last_is_yuv420 = !im.frame_is_hw &&
+            (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVJ420P);
+        // The YUV→RGB conversion (used only for dump_last_frame_ppm) lives in
+        // dump_last_frame_ppm() itself, so the per-frame path stays cheap.
+        im.consecutive_errors = 0;
+        im.packets_without_frame = 0;
+        got_frame = true;
     }
 
-    width   = impl_->frame->width;
-    height  = impl_->frame->height;
-    impl_->last_w = width;
-    impl_->last_h = height;
-    // Hardware output carries a frame-pool reference; software output does not.
-    impl_->frame_is_hw = (impl_->frame->hw_frames_ctx != nullptr);
+    if (hard_error) {
+        ++im.errors;
+        if (!got) ++im.consecutive_errors;
+        if (im.error_logs++ < 5 || im.error_logs % 100 == 0) {
+            char err[AV_ERROR_MAX_STRING_SIZE]{};
+            av_strerror(hard_error, err, sizeof(err));
+            LOG_WARN << "H264Decoder: libavcodec error: " << err
+                     << " (consecutive=" << im.consecutive_errors
+                     << ", total=" << im.errors << ')';
+        }
+    }
 
-    // GPU surfaces stay resident until presentation. Pixel planes are only
-    // accessed for software output; no staging texture or CPU readback.
-    impl_->last_is_yuv420 = !impl_->frame_is_hw &&
-        (impl_->frame->format == AV_PIX_FMT_YUV420P ||
-         impl_->frame->format == AV_PIX_FMT_YUVJ420P);
-    // The YUV→RGB conversion (used only for dump_last_frame_ppm)
-    // moved out of the per-frame hot path — it cost ~2-5 ms per
-    // frame at 4K and was always overhead since dump_last_frame_ppm
-    // is invoked only on the very first decoded frame. The sws
-    // pass now lives inside dump_last_frame_ppm() itself, run on
-    // demand against the still-alive software frame.
+    // Slow GPU decode for a long stretch: the CPU is the better choice.
+    if (got && using_hardware() && ms > kSlowGpuDecodeMs) {
+        if (++im.slow_streak >= kSlowGpuStreak) {
+            fallback_to_software("GPU decoding too slow");
+            got_frame = false;   // the picture it produced belongs to the old decoder
+            width = height = 0;
+            return true;
+        }
+    } else if (got) {
+        im.slow_streak = 0;
+    }
 
-    ++impl_->frames_out;
-    got_frame = true;
-    return true;
+    if (!got && (im.consecutive_errors >= kErrorsBeforeResync ||
+                 im.packets_without_frame >= kPacketsWithoutFrame)) {
+        const auto now = Clock::now();
+        while (!im.recent_resyncs.empty() &&
+               now - im.recent_resyncs.front() > kEscalateWindow)
+            im.recent_resyncs.pop_front();
+        im.recent_resyncs.push_back(now);
+        const char* why = im.consecutive_errors >= kErrorsBeforeResync
+            ? "repeated decode errors" : "decoder produced no pictures";
+        if (im.recent_resyncs.size() >= kEscalateCount) {
+            im.recent_resyncs.clear();
+            if (using_hardware()) {
+                fallback_to_software("GPU decoder keeps failing");
+            } else {
+                LOG_WARN << "decoder: reopening software decoder (" << why << ')';
+                im.open(im.codec_id);
+                im.begin_wait_for_idr();
+                ++im.resyncs;
+            }
+        } else {
+            resync(why);
+        }
+        return true;
+    }
+    return !hard_error || got;
+}
+
+void H264Decoder::resync(const char* reason) {
+    auto& im = *impl_;
+    if (!im.ctx) return;
+    LOG_WARN << "decoder: resync (" << (reason ? reason : "?")
+             << ") — waiting for the next key frame";
+    avcodec_flush_buffers(im.ctx);
+    im.begin_wait_for_idr();
+    ++im.resyncs;
+}
+
+bool H264Decoder::using_hardware() const {
+    return impl_ && impl_->backend == Impl::HwBackend::D3D11VA &&
+           (impl_->frames_out == 0 || impl_->frame_is_hw);
+}
+
+bool H264Decoder::hardware_distrusted() {
+    if (g_hw_failures.load() < kDistrustFailures) return false;
+    const int64_t since = steady_now_ns() - g_last_hw_failure_ns.load();
+    return since < std::chrono::duration_cast<std::chrono::nanoseconds>(kDistrustDuration).count();
+}
+
+bool H264Decoder::fallback_to_software(const char* reason) {
+    auto& im = *impl_;
+    if (im.backend != Impl::HwBackend::D3D11VA && !im.hwaccel_requested) return true;
+    LOG_WARN << "decoder: switching from GPU to software decoding ("
+             << (reason ? reason : "?") << ')';
+    ++g_hw_failures;
+    g_last_hw_failure_ns.store(steady_now_ns());
+    im.hwaccel_requested = false;
+    im.hw_pix_fmt = AV_PIX_FMT_NONE;
+    // Release surfaces still pinned by the previous decoder output.
+    if (im.frame) av_frame_unref(im.frame);
+    im.last_w = im.last_h = 0;
+    im.frame_is_hw = false;
+    if (im.hw_device_d3d11) av_buffer_unref(&im.hw_device_d3d11);
+    const bool ok = im.open(im.codec_id);
+    im.begin_wait_for_idr();
+    ++im.resyncs;
+    return ok;
+}
+
+H264Decoder::Stats H264Decoder::stats() {
+    Stats st;
+    if (!impl_) return st;
+    auto& im = *impl_;
+    st.packets  = im.packets_in;
+    st.frames   = im.frames_out;
+    st.errors   = im.errors;
+    st.skipped  = im.skipped;
+    st.resyncs  = im.resyncs;
+    st.consecutive_errors = im.consecutive_errors;
+    st.last_ms  = im.last_ms;
+    st.avg_ms   = im.avg_ms;
+    st.max_ms   = im.max_ms;
+    im.max_ms   = 0;
+    return st;
 }
 
 bool H264Decoder::dump_last_frame_ppm(const std::string& path) {

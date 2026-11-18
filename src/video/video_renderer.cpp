@@ -1,5 +1,5 @@
 #include "video/video_renderer.h"
-#include "platform/desktop_controls.h"
+#include "platform/thread_tuning.h"
 #include "video/video_recorder.h"
 #include "video/gpu_video.h"
 #include "video/cover_art.h"
@@ -398,9 +398,9 @@ AVBufferRef* VideoRenderer::gpu_device_ref() {
     return running_.load() && gpu_device_ ? av_buffer_ref(gpu_device_) : nullptr;
 }
 
-bool VideoRenderer::start(const std::string& title, bool start_hidden) {
+bool VideoRenderer::start(const std::string& title) {
     running_ = true;
-    thread_  = std::thread(&VideoRenderer::run, this, title, start_hidden);
+    thread_  = std::thread(&VideoRenderer::run, this, title);
     return true;
 }
 
@@ -549,6 +549,8 @@ void VideoRenderer::push_avframe(const AVFrame* src, int64_t origin_ns) {
 
     {
         std::lock_guard<std::mutex> lock(mtx_);
+        // Latest frame wins: a picture the display never took is replaced.
+        if (has_avframe_) frames_replaced_.fetch_add(1, std::memory_order_relaxed);
         // Move-assign: drops the previous frame's ref via
         // av_frame_free in DecodedFrame::operator=.
         slot_avframe_   = DecodedFrame{clone};
@@ -743,9 +745,7 @@ void VideoRenderer::push_frame_nv12(const uint8_t* y,  int y_stride,
     cv_.notify_one();
 }
 
-void VideoRenderer::run(const std::string& title, bool start_hidden) {
-    ap::platform::DesktopControls desktop;
-    bool tray_available = false;
+void VideoRenderer::run(const std::string& title) {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         LOG_ERROR << "SDL_Init failed: " << SDL_GetError();
         running_ = false;
@@ -791,8 +791,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
     }
     SDL_Window*   window   = SDL_CreateWindow(
         title.c_str(), initial_x, initial_y, initial_w, initial_h,
-        SDL_WINDOW_RESIZABLE | SDL_WINDOW_BORDERLESS
-            | (start_hidden ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN));
+        SDL_WINDOW_RESIZABLE | SDL_WINDOW_BORDERLESS);
     // Read the initial vsync preference from LiveSettings (default
     // true). Toggling at runtime is handled by SDL_RenderSetVSync
     // below in the render loop.
@@ -820,35 +819,13 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
              << 'x' << kDefaultWinHeight << ", resizable)";
     SDL_SetWindowMinimumSize(window, 960, 720);
 
-    bool presentation_pending = start_hidden;
-    auto reveal_window = [&]() {
-        if (presentation_pending) {
-            if (live_settings_ && live_settings_->fullscreen.load())
-                SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
-            else if ((!live_settings_ || !live_settings_->chromeless.load()) && preferences.window_maximized)
-                SDL_MaximizeWindow(window);
-            presentation_pending = false;
-        }
-        SDL_ShowWindow(window);
-        if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) SDL_RestoreWindow(window);
-        SDL_RaiseWindow(window);
-    };
     GpuVideo gpu_video;
 #if defined(_WIN32)
     SDL_SysWMinfo instance_window_info{};
     SDL_VERSION(&instance_window_info.version);
-    if (SDL_GetWindowWMInfo(window, &instance_window_info)) {
+    if (SDL_GetWindowWMInfo(window, &instance_window_info))
         SetPropW(instance_window_info.info.win.window,
                  ap::platform::kInstanceWindowProperty, reinterpret_cast<HANDLE>(1));
-        tray_available = desktop.start(instance_window_info.info.win.window,
-            [&](bool show) {
-                if (show) reveal_window();
-                else SDL_HideWindow(window);
-            }, [this] { closed_ = true; running_ = false; },
-            [this](ap::airplay::MediaCommand command) {
-                if (audio_control_handler_) audio_control_handler_(command, 0);
-            });
-    }
 #endif
     gpu_video.init(renderer);
     {
@@ -946,6 +923,16 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
     auto last_video_frame_time = std::chrono::steady_clock::now()
                                  - std::chrono::seconds(10);
 
+    // Adaptive presentation: when SDL_RenderPresent keeps blocking for a very
+    // long time with VSYNC on (display asleep, window hidden, driver stall),
+    // switch VSYNC off for a while so the render loop keeps running, then
+    // restore the user's setting.
+    bool  vsync_relief = false;
+    int   slow_present_streak = 0;
+    uint64_t slow_present_total = 0;
+    std::chrono::steady_clock::time_point vsync_relief_since{};
+    bool  keep_awake_on = false;
+
     // Persistent UI toggles (struct lifted to file scope above so
     // the SDL hit-test callback can access it). Defaults match the
     // design mockup (chrome visible). Chromeless mode hides toolbar
@@ -989,10 +976,10 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         if (live_settings_)
             live_settings_->fullscreen.store(fullscreen, std::memory_order_relaxed);
     };
-    if (fullscreen && !start_hidden) {
+    if (fullscreen) {
         SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
         SDL_ShowCursor(SDL_DISABLE);
-    } else if (!start_hidden && !ui.chromeless && preferences.window_maximized) {
+    } else if (!ui.chromeless && preferences.window_maximized) {
         SDL_MaximizeWindow(window);
     }
 
@@ -1004,7 +991,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         current.recording_encoder = static_cast<int>(recording_options.encoder);
         current.recording_bitrate = recording_options.bitrate_mbps;
         const Uint32 flags = SDL_GetWindowFlags(window);
-        if (!presentation_pending && !fullscreen && !ui.chromeless && !(flags & SDL_WINDOW_MINIMIZED)) {
+        if (!fullscreen && !ui.chromeless && !(flags & SDL_WINDOW_MINIMIZED)) {
             current.window_maximized = (flags & SDL_WINDOW_MAXIMIZED) != 0;
             if (!current.window_maximized) {
                 SDL_GetWindowPosition(window, &current.window_x, &current.window_y);
@@ -1054,6 +1041,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         live_settings_->mirror_hwaccel.store(defaults.mirror_hwaccel);
         live_settings_->vsync_enabled.store(defaults.vsync_enabled);
         live_settings_->video_rotation.store(defaults.video_rotation);
+        live_settings_->auto_recover_seconds.store(defaults.auto_recover_seconds);
         live_settings_->fullscreen.store(defaults.fullscreen);
         live_settings_->chromeless.store(defaults.chromeless);
         preferences = defaults.ui;
@@ -1142,14 +1130,13 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         }
     };
 
-    if (start_hidden) {
-        if (tray_available) SDL_HideWindow(window);
-        else reveal_window();
-    }
     ap::platform::FirewallMonitor firewall_monitor;
     while (running_.load()) {
         if (show_requested_.exchange(false)) {
-            reveal_window();
+            SDL_ShowWindow(window);
+            if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED)
+                SDL_RestoreWindow(window);
+            SDL_RaiseWindow(window);
 #if defined(_WIN32)
             if (instance_window_info.info.win.window)
                 SetForegroundWindow(instance_window_info.info.win.window);
@@ -1199,8 +1186,11 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         // call is cheap enough to issue every frame; we still
         // gate it on a state delta so we don't spam the driver.
         if (live_settings_) {
+            // The user's choice, temporarily overridden while presentation is
+            // blocking for a long time (see the present-time check below).
             const bool want_vsync =
-                live_settings_->vsync_enabled.load(std::memory_order_relaxed);
+                live_settings_->vsync_enabled.load(std::memory_order_relaxed) &&
+                !vsync_relief;
             if (want_vsync != vsync_active) {
                 if (SDL_RenderSetVSync(renderer, want_vsync ? 1 : 0) == 0) {
                     LOG_INFO << "VideoRenderer VSYNC "
@@ -1215,7 +1205,6 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
             // Always feed ImGui first so focus / hover / capture work.
             ImGui_ImplSDL2_ProcessEvent(&e);
             if (e.type == SDL_QUIT) {
-                if (tray_available) { SDL_HideWindow(window); continue; }
                 LOG_INFO << "VideoRenderer received SDL_QUIT";
                 closed_  = true;
                 running_ = false;
@@ -1240,7 +1229,6 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
                         if (fullscreen)         toggle_fullscreen();
                         else if (ui.chromeless) ui.chromeless = false;
                         else if (ui.settings_open) ui.settings_open = false;
-                        else if (tray_available) SDL_HideWindow(window);
                         else { closed_ = true; running_ = false; }
                         break;
                     case SDLK_f:
@@ -1353,15 +1341,25 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
                     // the FFmpeg pool → SDL staging texture.
                     if (af->format == AV_PIX_FMT_D3D11) {
                         if (!gpu_video.convert(renderer, video_tex, af)) {
-                            LOG_ERROR << "D3D11 surface conversion failed";
+                            // Count the streak so the decoder can leave the GPU
+                            // path; log sparingly (this can happen 60x/second).
+                            const int streak = gpu_convert_failures_.fetch_add(
+                                1, std::memory_order_relaxed) + 1;
+                            if (streak == 1 || streak % 120 == 0)
+                                LOG_ERROR << "D3D11 surface conversion failed (in a row: "
+                                          << streak << ')';
                             gpu_video.reset_target();
                             SDL_DestroyTexture(video_tex);
                             video_tex = nullptr;
+                        } else {
+                            gpu_convert_failures_.store(0, std::memory_order_relaxed);
+                            frames_presented_.fetch_add(1, std::memory_order_relaxed);
                         }
                     } else if (af->format == AV_PIX_FMT_NV12) {
                         SDL_UpdateNVTexture(video_tex, nullptr,
                             af->data[0], af->linesize[0],
                             af->data[1], af->linesize[1]);
+                        frames_presented_.fetch_add(1, std::memory_order_relaxed);
                     } else {
                         // YUV420P / YUVJ420P (full-range) — SDL
                         // treats both as IYUV, slight color-range
@@ -1371,6 +1369,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
                             af->data[0], af->linesize[0],
                             af->data[1], af->linesize[1],
                             af->data[2], af->linesize[2]);
+                        frames_presented_.fetch_add(1, std::memory_order_relaxed);
                     }
                 } else if (have_nv12) {
                     SDL_UpdateNVTexture(video_tex, nullptr,
@@ -1388,7 +1387,6 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
 
         // --- Drop the cover if clear_session was called --------------
         if (clear_cover_requested_.exchange(false, std::memory_order_relaxed)) {
-            desktop.artwork(nullptr, 0);
             if (cover_tex) {
                 SDL_DestroyTexture(cover_tex);
                 cover_tex   = nullptr;
@@ -1429,8 +1427,6 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
                 idle_changed = true;
             }
         }
-        if (!pending_cover.empty()) desktop.artwork(pending_cover.data(), pending_cover.size());
-        if (meta_changed) desktop.metadata(t_title, t_artist, t_album);
         if (idle_changed) {
             make_text(fonts_big,   t_idle_name,
                       SDL_Color{255, 255, 255, 255},
@@ -1490,14 +1486,11 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         const bool playing_now = playing_.load(std::memory_order_relaxed);
         DeviceInfo active_dev;
         const bool has_active_dev = active_device_snapshot(active_dev);
-        const uint32_t media_total = progress_total_ms_.load();
-        uint64_t media_elapsed = progress_elapsed_ms_.load();
-        const int64_t media_pushed = progress_pushed_at_ns_.load();
-        const auto media_now = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-        if (playing_now && media_pushed > 0 && media_now > media_pushed)
-            media_elapsed += (media_now - media_pushed) / 1000000;
-        desktop.publish(has_active_dev, playing_now, audio_control_available_.load(),
-            static_cast<uint32_t>(std::min<uint64_t>(media_elapsed, media_total)), media_total);
+        if (has_active_dev != keep_awake_on) {
+            // Idle sleep would drop the connection while a phone is mirroring.
+            keep_awake_on = has_active_dev;
+            ap::platform::set_keep_awake(keep_awake_on);
+        }
         const bool show_video =
             video_tex && active_dev.kind != "Audio" && (video_fresh || has_active_dev || !playing_now);
 
@@ -2500,7 +2493,33 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         ImGui_ImplSDLRenderer2_RenderDrawData(
             ImGui::GetDrawData(), renderer);
 
+        const auto present_t0 = std::chrono::steady_clock::now();
         SDL_RenderPresent(renderer);
+        {
+            const auto present_t1 = std::chrono::steady_clock::now();
+            const auto present_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                present_t1 - present_t0).count();
+            if (present_ms > 250) {
+                ++slow_present_total;
+                if (slow_present_total <= 3 || slow_present_total % 100 == 0)
+                    LOG_WARN << "VideoRenderer: SDL_RenderPresent took " << present_ms
+                             << " ms (count=" << slow_present_total << ')';
+                if (vsync_active && ++slow_present_streak >= 3) {
+                    vsync_relief = true;
+                    vsync_relief_since = present_t1;
+                    slow_present_streak = 0;
+                    LOG_WARN << "VideoRenderer: presentation is blocking — "
+                                "VSYNC off temporarily";
+                }
+            } else {
+                slow_present_streak = 0;
+            }
+            if (vsync_relief &&
+                present_t1 - vsync_relief_since > std::chrono::seconds(15)) {
+                vsync_relief = false;   // try the user's setting again
+                LOG_INFO << "VideoRenderer: restoring VSYNC setting";
+            }
+        }
 
         // Pipeline-latency measurement: from when the encrypted
         // frame body finished arriving on the wire (origin_ns
@@ -2523,6 +2542,7 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
         }
     }
 
+    if (keep_awake_on) ap::platform::set_keep_awake(false);
     if (recorder_) recorder_->stop();
     publish_preferences();
     if (title_tex)     SDL_DestroyTexture(title_tex);
@@ -2540,7 +2560,6 @@ void VideoRenderer::run(const std::string& title, bool start_hidden) {
     ImGui_ImplSDLRenderer2_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
-    desktop.stop();
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_QuitSubSystem(SDL_INIT_VIDEO);

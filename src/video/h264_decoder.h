@@ -85,6 +85,40 @@ public:
     // logging decrypted IDR / non-IDR frames.
     bool is_hevc() const;
 
+    // ---- health and recovery ----------------------------------------------
+
+    // True while the decoder is producing D3D11 hardware surfaces.
+    bool using_hardware() const;
+
+    // Leave the GPU path and continue in software. The cached parameter sets
+    // are kept, so the next IDR decodes normally. Safe to call when already
+    // running in software (returns true and does nothing). Also records the
+    // failure so later sessions in this process do not retry a broken GPU.
+    bool fallback_to_software(const char* reason);
+
+    // True once the GPU path failed in this process (see above). New decoders
+    // then start in software even when GPU decoding is enabled in settings.
+    static bool hardware_distrusted();
+
+    // Flush libavcodec's reference frames and skip inter frames until the next
+    // IDR (for at most ~1.5 s, so a sender that rarely sends IDRs cannot leave
+    // the picture frozen). Called automatically after repeated errors.
+    void resync(const char* reason);
+
+    struct Stats {
+        uint64_t packets          = 0;   // packets handed to libavcodec
+        uint64_t frames           = 0;   // pictures produced
+        uint64_t errors           = 0;   // failed send/receive calls
+        uint64_t skipped          = 0;   // inter frames skipped while waiting for IDR
+        uint64_t resyncs          = 0;
+        int      consecutive_errors = 0;
+        double   last_ms          = 0;   // duration of the latest decode() call
+        double   avg_ms           = 0;   // smoothed
+        double   max_ms           = 0;   // since the previous stats() call
+    };
+    // Returns a snapshot and resets the max_ms window.
+    Stats stats();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -2,6 +2,7 @@
 
 #include "airplay/media_control.h"
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -60,7 +61,7 @@ public:
 
     // Initialise SDL, create the window at a default size, start the
     // rendering thread. Returns false on SDL failure.
-    bool start(const std::string& title = "AirPlay-Windows", bool start_hidden = false);
+    bool start(const std::string& title = "WWinAirPlay");
 
     // Tell the thread to exit, join it, tear down SDL.
     void stop();
@@ -101,6 +102,56 @@ public:
     // (latest-wins) so no backlog accumulates if the GPU is slow.
     // Thread-safe.
     void push_avframe(const AVFrame* src, int64_t origin_ns = 0);
+
+    // ---- link supervision (used by main()) --------------------------------
+    // The mirror receiver reports that a stream is connected, and the time
+    // whenever any bytes arrive from the sender. main() resets the session when a
+    // connected stream stays silent longer than the user's recovery limit.
+    static int64_t steady_now_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void begin_mirror_link() {
+        unsigned count = mirror_link_count_.load(std::memory_order_acquire);
+        for (;;) {
+            if (count == 0)
+                mirror_last_rx_ns_.store(steady_now_ns(), std::memory_order_relaxed);
+            if (mirror_link_count_.compare_exchange_weak(count, count + 1,
+                    std::memory_order_acq_rel, std::memory_order_acquire))
+                break;
+        }
+    }
+    void end_mirror_link() {
+        unsigned count = mirror_link_count_.load(std::memory_order_acquire);
+        while (count != 0 &&
+               !mirror_link_count_.compare_exchange_weak(count, count - 1,
+                   std::memory_order_acq_rel, std::memory_order_acquire)) {}
+    }
+    void note_mirror_data() { mirror_last_rx_ns_.store(steady_now_ns(), std::memory_order_relaxed); }
+    bool    mirror_link_active() const { return mirror_link_count_.load(std::memory_order_acquire) != 0; }
+    int64_t mirror_last_rx_ns()  const { return mirror_last_rx_ns_.load(std::memory_order_relaxed); }
+    // Recorded when the session was reset automatically; the UI shows a notice.
+    void note_auto_recovery() {
+        auto_recovery_ns_.store(steady_now_ns(), std::memory_order_relaxed);
+        auto_recovery_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+    int64_t  auto_recovery_ns()    const { return auto_recovery_ns_.load(std::memory_order_relaxed); }
+    uint64_t auto_recovery_count() const { return auto_recovery_count_.load(std::memory_order_relaxed); }
+
+    // ---- feedback for the decode side -------------------------------------
+    // D3D11 pictures in a row that could not be converted for display (GPU
+    // device lost / driver reset). The mirror listener switches the decoder
+    // to software when this keeps growing, then resets it.
+    int  gpu_convert_failures() const {
+        return gpu_convert_failures_.load(std::memory_order_relaxed);
+    }
+    void reset_gpu_convert_failures() {
+        gpu_convert_failures_.store(0, std::memory_order_relaxed);
+    }
+    // Pictures actually uploaded for display / pictures that were replaced by
+    // a newer one before the display could take them (latest-frame-wins).
+    uint64_t frames_presented() const { return frames_presented_.load(std::memory_order_relaxed); }
+    uint64_t frames_replaced()  const { return frames_replaced_.load(std::memory_order_relaxed); }
 
     // Caller owns the returned FFmpeg ref. Null when D3D11 is unavailable.
     AVBufferRef* gpu_device_ref();
@@ -197,7 +248,7 @@ public:
     bool user_closed() const { return closed_.load(); }
 
 private:
-    void run(const std::string& title, bool start_hidden);
+    void run(const std::string& title);
 
     std::atomic<bool> running_{false};
     std::atomic<bool> show_requested_{false};
@@ -287,6 +338,13 @@ private:
     std::atomic<int>           video_w_seen_{0};
     std::atomic<int>           video_h_seen_{0};
     std::atomic<uint64_t>      frames_total_{0};
+    std::atomic<int>           gpu_convert_failures_{0};
+    std::atomic<unsigned>      mirror_link_count_{0};
+    std::atomic<int64_t>       mirror_last_rx_ns_{0};
+    std::atomic<int64_t>       auto_recovery_ns_{0};
+    std::atomic<uint64_t>      auto_recovery_count_{0};
+    std::atomic<uint64_t>      frames_presented_{0};
+    std::atomic<uint64_t>      frames_replaced_{0};
 
     // Bandwidth accounting for the mirror payload. Updated from
     // record_payload_bytes() — the mirror listener calls it once
