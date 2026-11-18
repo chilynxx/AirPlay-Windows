@@ -29,6 +29,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Pre-flight: fail in seconds if a file the build needs never made it into
+      # the repository. Without this, a forgotten source file only shows up after
+      # the ~30 minute vcpkg library build, as "Cannot find source file" in the
+      # Configure step. `python tools/check_sources.py` prints the same list locally.
+      - name: Set up Python (pre-flight check)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Pre-flight - sources and headers are all in the repository
+        run: python tools/check_sources.py
+
       # The pre-installed vcpkg on windows-latest sits at a recent
       # commit whose working tree carries port versions that aren't
       # listed in our manifest's `builtin-baseline` versions/baseline.json.
