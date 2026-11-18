@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
-project(airplay-windows VERSION 0.4.1 LANGUAGES C CXX)
+project(WWinAirPlay VERSION 0.4.1 LANGUAGES C CXX)
+if(WIN32)
+    enable_language(RC)   # application icon and version information (assets/winairplay.rc)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -297,11 +300,10 @@ if(MSVC)
 endif()
 
 # ---- Sources ------------------------------------------------------------------
-add_executable(airplay-windows
+add_executable(WWinAirPlay
     src/main.cpp
     src/log.cpp
     src/settings.cpp
-    src/platform/desktop_controls.cpp
     src/net/socket.cpp
     src/net/tcp_server.cpp
     src/mdns/mdns_service.cpp
@@ -334,6 +336,7 @@ add_executable(airplay-windows
     src/video/video_renderer.cpp
     src/platform/firewall.cpp
     src/video/cover_art.cpp
+    src/video/image_loader.cpp
     src/audio/audio_receiver.cpp
     src/audio/aac_decoder.cpp
     src/audio/audio_output.cpp
@@ -341,14 +344,14 @@ add_executable(airplay-windows
     src/usb/usb_supervisor.cpp
 )
 
-target_include_directories(airplay-windows PRIVATE src)
-target_link_libraries(airplay-windows PRIVATE OpenSSL::Crypto ${FFMPEG_TARGETS} ${SDL2_TARGET} ${SDL2_TTF_TARGET} imgui)
+target_include_directories(WWinAirPlay PRIVATE src third_party)
+target_link_libraries(WWinAirPlay PRIVATE OpenSSL::Crypto ${FFMPEG_TARGETS} ${SDL2_TARGET} ${SDL2_TTF_TARGET} imgui)
 if(_use_gst AND GSTREAMER_FOUND)
-    target_link_libraries(airplay-windows PRIVATE PkgConfig::GSTREAMER)
-    target_compile_definitions(airplay-windows PRIVATE HAVE_GSTREAMER_HLS=1)
+    target_link_libraries(WWinAirPlay PRIVATE PkgConfig::GSTREAMER)
+    target_compile_definitions(WWinAirPlay PRIVATE HAVE_GSTREAMER_HLS=1)
 endif()
 if(DEFINED FFMPEG_INCLUDE_DIRS_OK)
-    target_include_directories(airplay-windows PRIVATE ${FFMPEG_INCLUDE_DIRS_OK})
+    target_include_directories(WWinAirPlay PRIVATE ${FFMPEG_INCLUDE_DIRS_OK})
 endif()
 
 # ---- FairPlay SAP blobs (swap-ready) ------------------------------------------
@@ -357,12 +360,12 @@ endif()
 # we link that instead. See docs/FAIRPLAY.md.
 if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/fairplay_blobs_real.cpp")
     message(STATUS "FairPlay: using provisioned blob (fairplay_blobs_real.cpp)")
-    target_sources(airplay-windows PRIVATE
+    target_sources(WWinAirPlay PRIVATE
         third_party/fairplay_blobs_real.cpp)
 else()
     message(STATUS "FairPlay: using zero-filled STUB — iOS handshake will "
                    "fail at /fp-setup until a real blob is provided")
-    target_sources(airplay-windows PRIVATE
+    target_sources(WWinAirPlay PRIVATE
         third_party/fairplay_blobs_stub.cpp)
 endif()
 
@@ -378,13 +381,13 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/playfair/playfair.c")
         third_party/playfair/omg_hax.c
         third_party/playfair/modified_md5.c
         third_party/playfair/sap_hash.c)
-    target_sources(airplay-windows PRIVATE ${_playfair_srcs})
+    target_sources(WWinAirPlay PRIVATE ${_playfair_srcs})
     # UxPlay's source uses `#include "playfair/playfair.h"` from fairplay_playfair.c
     # and `#include "playfair.h"` from within playfair/*.c, so we expose both.
-    target_include_directories(airplay-windows PRIVATE
+    target_include_directories(WWinAirPlay PRIVATE
         third_party
         third_party/playfair)
-    target_compile_definitions(airplay-windows PRIVATE HAVE_PLAYFAIR=1)
+    target_compile_definitions(WWinAirPlay PRIVATE HAVE_PLAYFAIR=1)
 
     # Quiet down playfair's legacy-C warnings (intentional byte truncations,
     # unused-variable debug leftovers, a spurious C4701 in modified_md5.c).
@@ -402,8 +405,8 @@ endif()
 
 if(LIBPLIST_TARGET)
     message(STATUS "libplist: linking via ${LIBPLIST_TARGET}")
-    target_link_libraries(airplay-windows PRIVATE ${LIBPLIST_TARGET})
-    target_compile_definitions(airplay-windows PRIVATE HAVE_LIBPLIST=1)
+    target_link_libraries(WWinAirPlay PRIVATE ${LIBPLIST_TARGET})
+    target_compile_definitions(WWinAirPlay PRIVATE HAVE_LIBPLIST=1)
 else()
     message(FATAL_ERROR
         "libplist not found. Required for the /info binary plist — iOS will "
@@ -417,18 +420,22 @@ if(WIN32)
     # ws2_32: Winsock; iphlpapi: GetAdaptersAddresses; dnsapi: native mDNS;
     # dwmapi: DwmSetWindowAttribute for the Win11 Mica backdrop on the
     # VideoRenderer window.
-    target_link_libraries(airplay-windows PRIVATE
+    target_link_libraries(WWinAirPlay PRIVATE
         ws2_32 iphlpapi dnsapi dwmapi d3d11
-        setupapi shell32 ole32 oleaut32 windowsapp)   # USB, Lockdown lookup and firewall COM API
+        setupapi shell32 ole32 oleaut32)   # USB, Lockdown lookup and firewall COM API
 
     # Released as a GUI app so no empty console window pops up when
     # launched from File Explorer. main() stays the entry point — the
     # /ENTRY override avoids having to add a WinMain stub.
-    set_target_properties(airplay-windows PROPERTIES WIN32_EXECUTABLE TRUE)
+    set_target_properties(WWinAirPlay PROPERTIES WIN32_EXECUTABLE TRUE)
+    # Product identity and output executable are both WWinAirPlay.
+    target_sources(WWinAirPlay PRIVATE assets/winairplay.rc)
+    # RC resolves resource file names through its include paths; include assets
+    # so the relative winairplay.ico reference works on clean Windows runners.
+    set_source_files_properties(assets/winairplay.rc PROPERTIES
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/assets")
     if(MSVC)
-        set_source_files_properties(src/platform/desktop_controls.cpp PROPERTIES
-            COMPILE_OPTIONS "/std:c++20")
-        target_link_options(airplay-windows PRIVATE "/ENTRY:mainCRTStartup")
+        target_link_options(WWinAirPlay PRIVATE "/ENTRY:mainCRTStartup")
     endif()
 endif()
 
@@ -447,7 +454,7 @@ if(WIN32 AND BUILD_GPU_TESTS)
         COMMAND_EXPAND_LISTS)
 endif()
 
-# Use $<TARGET_RUNTIME_DLLS:airplay-windows> (CMake 3.21+) to copy ONLY
+# Use $<TARGET_RUNTIME_DLLS:WWinAirPlay> (CMake 3.21+) to copy ONLY
 # the shared libraries the linker actually depends on transitively —
 # pulls SDL2.dll, SDL2_ttf.dll, avcodec-*.dll, libplist-*.dll,
 # gstreamer-1.0-0.dll, gstapp-*.dll, glib-2.0-0.dll, … without dragging
@@ -461,12 +468,12 @@ endif()
 # its registered plugin path — practically: as long as the user has
 # GStreamer's bin/ on PATH the plugins resolve at startup.
 if(WIN32)
-    add_custom_command(TARGET airplay-windows POST_BUILD
+    add_custom_command(TARGET WWinAirPlay POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_RUNTIME_DLLS:airplay-windows>
-            $<TARGET_FILE_DIR:airplay-windows>
+            $<TARGET_RUNTIME_DLLS:WWinAirPlay>
+            $<TARGET_FILE_DIR:WWinAirPlay>
         COMMAND_EXPAND_LISTS
-        COMMENT "Deploying linked runtime DLLs next to airplay-windows.exe"
+        COMMENT "Deploying linked runtime DLLs next to WWinAirPlay.exe"
         VERBATIM)
 endif()
 
@@ -476,8 +483,8 @@ endif()
 if(NOT WIN32 AND PkgConfig_FOUND)
     pkg_check_modules(AVAHI_CLIENT IMPORTED_TARGET avahi-client)
     if(AVAHI_CLIENT_FOUND)
-        target_link_libraries(airplay-windows PRIVATE PkgConfig::AVAHI_CLIENT)
-        target_compile_definitions(airplay-windows PRIVATE HAVE_AVAHI=1)
+        target_link_libraries(WWinAirPlay PRIVATE PkgConfig::AVAHI_CLIENT)
+        target_compile_definitions(WWinAirPlay PRIVATE HAVE_AVAHI=1)
         message(STATUS "Avahi: linking via PkgConfig::AVAHI_CLIENT")
     else()
         message(STATUS "Avahi: not found — mDNS disabled on this Linux build "
@@ -525,4 +532,71 @@ if(BUILD_NETWORK_TESTS)
     add_test(NAME cover-art COMMAND test-cover-art)
     set_tests_properties(audio-timing PROPERTIES TIMEOUT 20)
     set_tests_properties(socket-shutdown PROPERTIES TIMEOUT 25)
+endif()
+
+# Long-session stability tests (opt-in so a normal build never depends on them):
+# duplicate filter, sound-device watchdog, decoder recovery and the whole mirror
+# receive path. The last two need an FFmpeg with the libx264 encoder and skip
+# themselves otherwise.
+option(BUILD_STABILITY_TESTS "Build the long-session stability tests" OFF)
+# Never let a missing test file break the build of the application itself.
+set(_stability_files
+    tools/test_seq_dedup.cpp tools/test_audio_output.cpp
+    tools/test_decoder_recovery.cpp tools/test_mirror_pipeline.cpp
+    tools/test_volume_memory.cpp tools/test_link_watchdog.cpp
+    tools/test_image_loader.cpp tools/image_fixtures.h tools/test_master_volume.cpp
+    tools/h264_test_stream.h)
+set(_stability_present TRUE)
+foreach(_f IN LISTS _stability_files)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_f}")
+        set(_stability_present FALSE)
+    endif()
+endforeach()
+if(BUILD_STABILITY_TESTS AND NOT _stability_present)
+    message(WARNING "BUILD_STABILITY_TESTS is ON but files in tools/ are missing; "
+                    "skipping the stability tests.")
+endif()
+if(BUILD_STABILITY_TESTS AND _stability_present)
+    add_executable(test-seq-dedup tools/test_seq_dedup.cpp)
+    target_include_directories(test-seq-dedup PRIVATE src)
+    add_executable(test-volume-memory tools/test_volume_memory.cpp)
+    target_include_directories(test-volume-memory PRIVATE src)
+    add_executable(test-link-watchdog tools/test_link_watchdog.cpp)
+    target_include_directories(test-link-watchdog PRIVATE src)
+    add_executable(test-master-volume tools/test_master_volume.cpp)
+    target_include_directories(test-master-volume PRIVATE src)
+    add_executable(test-image-loader tools/test_image_loader.cpp src/video/image_loader.cpp)
+    target_include_directories(test-image-loader PRIVATE src third_party tools)
+    add_executable(test-audio-output tools/test_audio_output.cpp src/audio/audio_output.cpp src/log.cpp)
+    target_include_directories(test-audio-output PRIVATE src)
+    target_link_libraries(test-audio-output PRIVATE ${SDL2_TARGET})
+    add_executable(test-decoder-recovery tools/test_decoder_recovery.cpp
+        src/video/h264_decoder.cpp src/log.cpp)
+    target_include_directories(test-decoder-recovery PRIVATE src tools ${FFMPEG_INCLUDE_DIRS_OK})
+    target_link_libraries(test-decoder-recovery PRIVATE ${FFMPEG_TARGETS})
+    add_executable(test-mirror-pipeline tools/test_mirror_pipeline.cpp
+        src/airplay/mirror_listener.cpp src/airplay/h264_nal.cpp src/airplay/h264_sps.cpp
+        src/crypto/mirror_decrypt.cpp src/video/h264_decoder.cpp src/net/socket.cpp src/log.cpp)
+    target_include_directories(test-mirror-pipeline PRIVATE src tools ${FFMPEG_INCLUDE_DIRS_OK})
+    target_link_libraries(test-mirror-pipeline PRIVATE ${FFMPEG_TARGETS} ${SDL2_TARGET}
+        ${SDL2_TTF_TARGET} OpenSSL::Crypto)
+    if(WIN32)
+        target_link_libraries(test-mirror-pipeline PRIVATE ws2_32 iphlpapi)
+    else()
+        find_package(Threads REQUIRED)
+        target_link_libraries(test-decoder-recovery PRIVATE Threads::Threads)
+        target_link_libraries(test-audio-output PRIVATE Threads::Threads)
+        target_link_libraries(test-mirror-pipeline PRIVATE Threads::Threads)
+    endif()
+    enable_testing()
+    add_test(NAME seq-dedup COMMAND test-seq-dedup)
+    add_test(NAME volume-memory COMMAND test-volume-memory)
+    add_test(NAME link-watchdog COMMAND test-link-watchdog)
+    add_test(NAME master-volume COMMAND test-master-volume)
+    add_test(NAME image-loader COMMAND test-image-loader)
+    add_test(NAME audio-output COMMAND test-audio-output)
+    add_test(NAME decoder-recovery COMMAND test-decoder-recovery)
+    add_test(NAME mirror-pipeline COMMAND test-mirror-pipeline)
+    set_tests_properties(decoder-recovery PROPERTIES TIMEOUT 30)
+    set_tests_properties(mirror-pipeline PROPERTIES TIMEOUT 60)
 endif()

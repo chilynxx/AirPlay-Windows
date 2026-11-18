@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Multi-scenario test suite for airplay-windows pair-setup / pair-verify.
+Multi-scenario test suite for WWinAirPlay pair-setup / pair-verify.
 
-Runs against a live `airplay-windows` process on 127.0.0.1:7000. Exits 0
+Runs against a live `WWinAirPlay` process on 127.0.0.1:7000. Exits 0
 when every check passes, 1 otherwise.
 
 Scenarios:

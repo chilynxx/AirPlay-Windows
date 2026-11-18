@@ -1,4 +1,4 @@
-# AirPlay Windows Receiver
+# WWinAirPlay
 
 Native AirPlay receiver for Windows: screen mirroring, RAOP audio and MP4
 recording, based on [UxPlay](https://github.com/FDH2/UxPlay).
@@ -6,14 +6,14 @@ recording, based on [UxPlay](https://github.com/FDH2/UxPlay).
 Latest release: [v0.4.1](https://github.com/moieric11/AirPlay-Windows/releases/tag/v0.4.1)
 — [what changed](docs/releases/v0.4.1.md).
 
-![AirPlay Windows interface with Home, Music, Screen Mirroring and Settings navigation](docs/images/interface-preview.png)
+![WWinAirPlay interface with Home, Music, Screen Mirroring and Settings navigation](docs/images/interface-preview.png)
 
 ## Get started
 
 1. Download the Windows x64 ZIP from [Releases](https://github.com/moieric11/AirPlay-Windows/releases).
-2. Extract the complete ZIP and run `airplay-windows.exe`, keeping the supplied DLLs alongside it.
+2. Extract the complete ZIP and run `WWinAirPlay.exe`, keeping the supplied DLLs alongside it.
 3. Connect the sending device and the PC to the same local network.
-4. Open Screen Mirroring on the sending device and select `AirPlay-Windows`.
+4. Open Screen Mirroring on the sending device and select `WWinAirPlay`.
 
 The receiver uses native Windows mDNS; Bonjour SDK and Apple software are not
 required for normal network mirroring. The optional USB Personal Hotspot route
@@ -32,7 +32,7 @@ graphics hardware and drivers. Software decoding is available as a fallback.
 | Music information | Cover art, title/artist/album, elapsed/total time and pause state when supplied by the sender |
 | Display controls | Fullscreen, borderless Hide UI, automatic/manual rotation |
 | Recording | MP4 video with a stereo AAC audio track when RAOP audio is received |
-| Settings | Automatically saved in `%APPDATA%\AirPlay-Windows\settings.ini`, including display, diagnostics, window placement and recording preferences |
+| Settings | Automatically saved in the existing compatibility directory `%APPDATA%\AirPlay-Windows\settings.ini` (kept across the WWinAirPlay rename), including display, diagnostics, window placement and recording preferences |
 | Sessions | One active device session at a time |
 | Direct HLS playback | Experimental, opt-in with `--hls-proxy-playback` |
 | DRM-protected streaming | Not supported |
@@ -89,6 +89,30 @@ queue is limited to one frame.
 Software decoding remains selectable. **VSYNC** is a separate display setting:
 enabled synchronizes presentation to the display; disabled can reduce waiting
 but may introduce tearing. Keep the setting that works best on your display.
+
+### Automatic recovery during long sessions
+
+The receiver watches its own pipeline and repairs it instead of freezing:
+
+- **GPU to CPU fallback.** If GPU decoding or the GPU color conversion keeps
+  failing (driver reset, device removed, decoder too slow), the session continues
+  with software decoding. A GPU that failed twice is not retried for 30 minutes.
+  Your saved setting is not changed.
+- **Decoder resynchronisation.** After repeated decode errors the decoder is
+  flushed and waits for the next key frame (at most 1.5 s), then continues.
+- **Silent sender.** If the mirror stream receives nothing for 30 s it is closed so
+  the receiver returns to idle instead of showing a frozen picture. A Wi-Fi stall
+  of a few seconds does not end the session.
+- **Audio.** Audio runs on its own threads and cannot be blocked by video. The
+  duplicate-packet filter no longer drops audio after the 16-bit RTP sequence
+  number wraps (this made sound fade out after roughly 10-25 minutes). Mirror
+  audio latency is kept bounded, and the sound device is reopened if it stops
+  consuming audio.
+- **Presentation.** If `SDL_RenderPresent` blocks for a very long time, VSYNC is
+  switched off for 15 s and then restored. The PC is kept awake while a sender is
+  connected, and Windows power throttling is disabled for the process.
+- **Networking.** UDP receive buffers are 1 MiB, and the control connection
+  tolerates about 30 s of Wi-Fi trouble before it is closed.
 
 The status bar's **Lat** value is a local pipeline estimate. It does not measure
 the sender's capture time, network transit time or exact display scan-out.
@@ -165,7 +189,7 @@ The released application opens without a console. Use `--log` or `--verbose`
 for startup/runtime logging when launched from a terminal:
 
 ```powershell
-.\airplay-windows.exe --log
+.\WWinAirPlay.exe --log
 ```
 
 | Option | Purpose |
@@ -175,6 +199,15 @@ for startup/runtime logging when launched from a terminal:
 | `--mirror-res WxH`, `-r WxH` | Override the advertised mirror resolution |
 | `--hls-proxy-playback`, `--hls` | Enable experimental direct HLS playback |
 | `--help`, `-h` | Show command-line help |
+
+### Log file
+
+Independently of `--log`, warnings, errors, session start/stop and a **health
+line every 10 seconds** are appended to `%APPDATA%\AirPlay-Windows\airplay.log` (the existing compatibility directory is retained across the WWinAirPlay rename)
+(1 MiB, then rotated once to `airplay.log.1`). The health lines show, for audio
+and video, whether packets are still arriving, how long the decoder takes, whether
+the GPU or CPU is decoding, and how many pictures were shown or replaced. After a
+freeze this file shows which stage stopped. Attach it when reporting a problem.
 
 Keep `identity.key` private to your installation: it is generated at first run
 and helps senders recognize the receiver across restarts. It is not included in
@@ -195,7 +228,7 @@ a direct USB video protocol implemented by this application:
 2. Connect a supported device by USB and accept **Trust This Computer** when prompted.
 3. Enable **Personal Hotspot > Allow Others to Join** on the device.
 4. Confirm Windows has a working Apple USB Ethernet connection, then select
-   `AirPlay-Windows` in Screen Mirroring.
+   `WWinAirPlay` in Screen Mirroring.
 
 Availability depends on the device, hotspot support, drivers and network setup;
 Apple documents the [USB Personal Hotspot requirements](https://support.apple.com/en-au/111785).
@@ -215,8 +248,8 @@ The commands below use a fresh vcpkg checkout pinned to the manifest baseline,
 matching the GitHub build rather than relying on a bundled vcpkg version:
 
 ```powershell
-git clone https://github.com/moieric11/AirPlay-Windows.git
-cd AirPlay-Windows
+git clone https://github.com/moieric11/AirPlay-Windows.git WWinAirPlay
+cd WWinAirPlay
 git clone https://github.com/microsoft/vcpkg.git build/vcpkg
 $baseline = (Get-Content vcpkg.json | ConvertFrom-Json).'builtin-baseline'
 git -C build/vcpkg checkout $baseline
@@ -226,7 +259,7 @@ cmake -S . -B build `
   -DCMAKE_TOOLCHAIN_FILE="$PWD/build/vcpkg/scripts/buildsystems/vcpkg.cmake" `
   -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
-.\build\Release\airplay-windows.exe
+.\build\Release\WWinAirPlay.exe
 ```
 
 For Visual Studio 2026, use `-G "Visual Studio 18 2026"` with a CMake version
@@ -263,6 +296,12 @@ python tools/test_pair_verify.py
 ```
 
 Socket shutdown regression tests are available with `-DBUILD_NETWORK_TESTS=ON`.
+`-DBUILD_STABILITY_TESTS=ON` builds the long-session tests: `seq-dedup` (audio duplicate
+filter across sequence wrap-around), `audio-output` (sound-device watchdog, uses
+SDL's dummy driver), and `decoder-recovery` / `mirror-pipeline` (decoder and the
+whole mirror receive path with a real H.264 stream, garbage injection, a stalled
+sender and a silent sender). The last two need an FFmpeg with the libx264 encoder
+and skip themselves otherwise.
 Build Release and run `ctest --test-dir build -C Release --output-on-failure`.
 On Windows, `build/Release/test-shutdown.exe --dacp` tests native DACP discovery,
 playback commands, seek units, HTTP failures and stale-session rejection.
@@ -304,16 +343,3 @@ including the bundled FairPlay reply data, are documented in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). No Apple runtime is needed for
 normal network mirroring; the Apple USB driver requirement applies only to the
 optional Personal Hotspot route.
-
-## Windows desktop integration
-
-Closing the receiver hides it to the notification area. Right-click its icon
-for Show, Hide or Exit; double-click to show the window. `--start-hidden`
-starts in the notification area and does not activate an existing instance.
-
-Windows media controls publish track metadata, artwork and progress. Their
-play/pause, previous and next buttons use the same DACP transport as the
-receiver UI, including during screen mirroring, and are enabled when the
-sender exposes usable DACP credentials.
-The audio duplicate filter retains sequence-based history across RTP wrap.
-Receiver naming remains available through the settings interface.

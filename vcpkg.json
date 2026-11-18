@@ -1,5 +1,5 @@
 {
-  "name": "airplay-windows",
+  "name": "wwinairplay",
   "version-string": "0.4.1",
   "dependencies": [
     "libplist",
