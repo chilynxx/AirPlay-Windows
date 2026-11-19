@@ -81,7 +81,7 @@ jobs:
           $env:SDL_VIDEODRIVER = "dummy"
           $env:SDL_AUDIODRIVER = "dummy"
           $proc = Start-Process `
-            -FilePath "build\Release\WinAirPlay.exe" `
+            -FilePath "build\Release\airplay-windows.exe" `
             -ArgumentList "--log" `
             -WindowStyle Hidden `
             -PassThru `
