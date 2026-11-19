@@ -1,4 +1,6 @@
 #include "platform/desktop_controls.h"
+#include "app_info.h"
+#include "i18n/localization.h"
 #include "log.h"
 #include <mutex>
 #if defined(_WIN32)
@@ -49,9 +51,13 @@ struct DesktopControls::Impl {
             if (l == WM_RBUTTONUP) {
                 HMENU menu = CreatePopupMenu();
                 if (!menu) return 0;
-                AppendMenuW(menu, MF_STRING, 1, L"Show");
-                AppendMenuW(menu, MF_STRING, 2, L"Hide");
-                AppendMenuW(menu, MF_STRING, 3, L"Exit");
+                const std::wstring show_txt = ap::i18n::tr_w(ap::i18n::Str::TrayShow);
+                const std::wstring hide_txt = ap::i18n::tr_w(ap::i18n::Str::TrayHide);
+                const std::wstring exit_txt = ap::i18n::tr_w(ap::i18n::Str::TrayExit);
+                AppendMenuW(menu, MF_STRING, 1, show_txt.c_str());
+                AppendMenuW(menu, MF_STRING, 2, hide_txt.c_str());
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(menu, MF_STRING, 3, exit_txt.c_str());
                 POINT point{}; GetCursorPos(&point);
                 SetForegroundWindow(hwnd);
                 const auto choice = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
@@ -87,15 +93,16 @@ bool DesktopControls::start(void* native, std::function<void(bool)> visibility,
     s.visibility = std::move(visibility); s.quit = std::move(quit);
     WNDCLASSW cls{};
     cls.lpfnWndProc = Impl::procedure; cls.hInstance = GetModuleHandleW(nullptr);
-    cls.lpszClassName = L"AirPlayWindows.DesktopControls";
+    cls.lpszClassName = L"WinAirPlay.DesktopControls";
     if (!RegisterClassW(&cls) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
-    s.window = CreateWindowExW(0, cls.lpszClassName, L"AirPlay-Windows", 0,
+    s.window = CreateWindowExW(0, cls.lpszClassName, ap::kAppNameW, 0,
                                0, 0, 0, 0, nullptr, nullptr, cls.hInstance, &s);
     if (!s.window) return false;
     s.icon.cbSize = sizeof(s.icon); s.icon.hWnd = s.window; s.icon.uID = 1;
     s.icon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; s.icon.uCallbackMessage = Impl::callback;
-    s.icon.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
-    wcscpy_s(s.icon.szTip, L"AirPlay-Windows");
+    s.icon.hIcon = LoadIconW(cls.hInstance, MAKEINTRESOURCEW(1));
+    if (!s.icon.hIcon) s.icon.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+    wcscpy_s(s.icon.szTip, ap::kAppNameW);
     s.tray = Shell_NotifyIconW(NIM_ADD, &s.icon) != FALSE;
     try {
         auto interop = get_activation_factory<SystemMediaTransportControls, ISystemMediaTransportControlsInterop>();
@@ -116,7 +123,7 @@ bool DesktopControls::start(void* native, std::function<void(bool)> visibility,
         });
         s.subscribed = true;
         s.media.IsEnabled(false);
-        metadata("AirPlay-Windows", "", "");
+        metadata(ap::kAppName, "", "");
         LOG_INFO << "Windows media controls ready (DACP)";
     } catch (const hresult_error& e) { LOG_WARN << "Windows media controls: " << to_string(e.message()); }
     return s.tray;
@@ -146,7 +153,7 @@ void DesktopControls::metadata(const std::string& title, const std::string& arti
 #if defined(_WIN32)
     try { if (impl_->media) {
         auto updater = impl_->media.DisplayUpdater(); updater.Type(MediaPlaybackType::Music);
-        auto music = updater.MusicProperties(); music.Title(to_hstring(title.empty() ? std::string("AirPlay-Windows") : title));
+        auto music = updater.MusicProperties(); music.Title(to_hstring(title.empty() ? std::string(ap::kAppName) : title));
         music.Artist(to_hstring(artist)); music.AlbumTitle(to_hstring(album)); updater.Update();
     }} catch (const hresult_error& e) { LOG_WARN << "Windows media metadata: " << to_string(e.message()); }
 #else
@@ -193,4 +200,4 @@ void DesktopControls::publish(bool active, bool playing, bool controls, uint32_t
     (void)active; (void)playing; (void)controls; (void)elapsed; (void)total;
 #endif
 }
-}
+} // namespace ap::platform

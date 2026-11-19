@@ -1,24 +1,29 @@
-// AirPlay-Windows — first-skeleton entry point.
+// WinAirPlay — Windows AirPlay 2 & Android Screen Mirroring Receiver entry point.
 //
 // Responsibilities of main():
-//   1. Initialise Winsock (net::global_init).
+//   1. Initialise Winsock (net::global_init) and Localization (i18n).
 //   2. Build a DeviceContext (identifiers echoed in both mDNS TXT and /info).
-//   3. Start the AirPlay RTSP-like server on TCP 7000.
-//   4. Start the native mDNS advertisement (Windows DnsService API).
-//   5. Block until Ctrl-C, then tear everything down cleanly.
+//   3. Start the AirPlay RTSP server on TCP 7000 and Android Mirror Server on TCP 7001.
+//   4. Start the native mDNS advertisement (Windows DnsService API) & USB Plug-and-Play Supervisor.
+//   5. Block until window close or Ctrl-C, running the smart self-healing watchdog loop.
 
 #include "airplay/hls_local_server.h"
+#include "airplay/link_watchdog.h"
 #include "airplay/live_settings.h"
 #include "airplay/server.h"
-#include "video/hls_player.h"
+#include "android/android_mirror.h"
+#include "app_info.h"
 #include "crypto/identity.h"
+#include "i18n/localization.h"
 #include "log.h"
 #include "mdns/mdns_service.h"
 #include "net/socket.h"
-#include "settings.h"
-#include "platform/single_instance.h"
 #include "platform/firewall.h"
+#include "platform/single_instance.h"
+#include "platform/thread_tuning.h"
+#include "settings.h"
 #include "usb/usb_supervisor.h"
+#include "video/hls_player.h"
 #include "video/video_renderer.h"
 
 #define SDL_MAIN_HANDLED
@@ -26,10 +31,9 @@
 
 #include <atomic>
 #include <chrono>
-#include <deque>
-#include <optional>
-#include <mutex>
 #include <csignal>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -49,27 +53,12 @@ BOOL WINAPI console_handler(DWORD type) {
 void signal_handler(int) { g_stop = true; }
 #endif
 
-// Pick sensible defaults. The PI and feature bitmask are copied from RPiPlay's
-// defaults — known to pass the initial iOS detection phase.
-//
-// `hls_playback` gates the AirPlay Streaming HLS proxy path (bits 0+4 of
-// features low word). When it's off, iOS routes YouTube / Photos to the
-// audio fallback — the mirror + RAOP-audio pipeline that actually behaves
-// like AirPlay mirror (low-latency, native). When on, iOS hands us an
-// mlhls:// URL and we play back via libavformat — works but acts like a
-// VOD player (probing, buffering, occasional stutter), best treated as
-// an opt-in experimental path.
 ap::airplay::DeviceContext build_device_context(bool hls_playback) {
     ap::airplay::DeviceContext ctx;
-    ctx.name     = "AirPlay-Windows";
+    ctx.name     = ap::kAppName;
     ctx.deviceid = ap::net::primary_mac();
     ctx.model    = "AppleTV3,2";
     ctx.pi       = "b08f5a79-db29-4384-b456-a4784d9e6055";
-    // Features:
-    //   0x5A7FFEE6 - UxPlay default (mirror + audio, no HLS/video push).
-    //   + bit 0    - AirPlay video supported  (enables AirPlay Streaming)
-    //   + bit 4    - HTTP live streaming (HLS) supported
-    //   High word 0x400: bit 42 "Screen Multi Codec" = HEVC mirror.
     ctx.features = hls_playback ? "0x5A7FFEF7,0x400"   // video+HLS+HEVC
                                 : "0x5A7FFEE6,0x400";  // HEVC mirror only
     ctx.srcvers  = "220.68";
@@ -79,29 +68,24 @@ ap::airplay::DeviceContext build_device_context(bool hls_playback) {
 } // namespace
 
 int main(int argc, char** argv) {
-    bool start_hidden = false;
-    for (int i = 1; i < argc; ++i) start_hidden |= std::string(argv[i]) == "--start-hidden";
 #if defined(_WIN32)
-    for (int i=1; i<argc; ++i)
-        if (std::string(argv[i])=="--configure-firewall") return ap::platform::configure_firewall();
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--configure-firewall") return ap::platform::configure_firewall();
     ap::platform::SingleInstance instance;
-    // Help is read-only and should remain usable while the receiver is open.
     bool help_only = false;
     for (int i = 1; i < argc; ++i)
         help_only |= std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h";
     if (!help_only) {
-        const auto result = instance.acquire(!start_hidden);
+        const auto result = instance.acquire();
         if (result == ap::platform::SingleInstance::Result::Secondary) return 0;
         if (result == ap::platform::SingleInstance::Result::Error) {
-            MessageBoxW(nullptr, L"Unable to initialize the single application instance.",
-                        L"AirPlay-Windows", MB_OK | MB_ICONERROR);
+            const std::wstring err_msg = ap::i18n::tr_w(ap::i18n::Str::SingleInstanceError);
+            MessageBoxW(nullptr, err_msg.c_str(), ap::kAppNameW, MB_OK | MB_ICONERROR);
             return 1;
         }
     }
 #endif
-    // Logs are off by default in the published binary. Scan for the
-    // toggle BEFORE anything else so even the very first init message
-    // honours the flag.
+
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--log" ||
             std::string(argv[i]) == "--verbose") {
@@ -111,10 +95,6 @@ int main(int argc, char** argv) {
     }
 
 #if defined(_WIN32)
-    // We're a /SUBSYSTEM:WINDOWS binary so no console pops up by
-    // default. With --log, attach to the parent terminal if we were
-    // launched from one (cmd, powershell, terminal); otherwise spawn
-    // a fresh console window so the user sees the stderr stream.
     const DWORD log_handle_type = GetFileType(GetStdHandle(STD_ERROR_HANDLE));
     const bool log_redirected = log_handle_type == FILE_TYPE_DISK || log_handle_type == FILE_TYPE_PIPE;
     if (ap::is_log_enabled() && !log_redirected) {
@@ -124,6 +104,8 @@ int main(int argc, char** argv) {
         freopen_s(&dummy, "CONOUT$", "w", stderr);
     }
 #endif
+
+    ap::platform::disable_process_power_throttling();
 
     auto saved = ap::load_settings();
     if (saved.mirror_width == 0 || saved.mirror_height == 0) {
@@ -152,11 +134,6 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, signal_handler);
 #endif
 
-    // Default mode: native AirPlay (mirror for video, RAOP for audio).
-    // This matches UxPlay's "no --hls" behaviour — low-latency, reliable,
-    // but YouTube/Photos play audio-only with thumbnail. Opt-in HLS
-    // proxy for the rare cases where you want the video stream delivered
-    // via the signed-CDN path we built.
     bool hls_playback = false;
     bool mirror_hwaccel = saved.mirror_hwaccel;
     int  mirror_w = saved.mirror_width;
@@ -168,9 +145,6 @@ int main(int argc, char** argv) {
         } else if (arg == "--mirror-hwaccel") {
             mirror_hwaccel = true;
         } else if ((arg == "--mirror-res" || arg == "-r") && i + 1 < argc) {
-            // Accept "WxH" or "WxHi" with either separator, e.g. 1920x1080,
-            // 2560x1440, 3840x2160. Anything malformed falls back silently
-            // to the default and logs a warning.
             const std::string val = argv[++i];
             const auto x = val.find_first_of("xX*");
             if (x != std::string::npos) {
@@ -190,39 +164,26 @@ int main(int argc, char** argv) {
                              << "), keeping default";
                 }
             }
-        } else if (arg == "--start-hidden") {
-            // Parsed before single-instance activation.
         } else if (arg == "--log" || arg == "--verbose") {
-            // Already handled in the pre-init scan above; consume so
-            // future unknown-arg paths don't trip on it.
+            // Handled in pre-init scan
         } else if (arg == "--help" || arg == "-h") {
             std::puts(
-                "AirPlay-Windows [--log] [--hls-proxy-playback]\n"
-                "                [--mirror-res WxH] [--mirror-hwaccel] [--start-hidden]\n"
-                "  --start-hidden        start in the Windows notification area\n"
+                "WinAirPlay [--log] [--hls-proxy-playback]\n"
+                "           [--mirror-res WxH] [--mirror-hwaccel]\n"
                 "  --log / --verbose     print init/runtime logs to stderr\n"
-                "                        (off by default in the released\n"
-                "                        binary)\n"
                 "  --hls-proxy-playback  advertise HLS capability so iOS\n"
                 "                        hands video URLs to our proxy\n"
-                "                        (experimental, VOD-style latency)\n"
                 "  --mirror-res WxH      advertise the given display\n"
-                "                        resolution to iOS (default: saved or\n"
-                "                        detected display, else 2560x1440;\n"
-                "                        higher = sharper portrait at the cost\n"
-                "                        of bandwidth, common: 1920x1080,\n"
-                "                        2560x1440, 3840x2160)\n"
+                "                        resolution (default: 2560x1440)\n"
                 "  --mirror-hwaccel      decode mirror H.264/HEVC on the GPU\n"
-                "                        (D3D11VA, GPU-resident presentation).\n"
-                "                        No CPU pixel readback for display.\n"
-                "                        Software fallback if unavailable.");
+                "                        (D3D11VA, GPU-resident presentation).");
             ap::net::global_shutdown();
             return 0;
         }
     }
 
     auto ctx = build_device_context(hls_playback);
-    ctx.name = saved.receiver_name;
+    ctx.name           = saved.receiver_name;
     ctx.mirror_width   = mirror_w;
     ctx.mirror_height  = mirror_h;
     ctx.mirror_hwaccel = mirror_hwaccel;
@@ -230,12 +191,8 @@ int main(int argc, char** argv) {
     LOG_INFO << "Mirror decoder default: "
              << (mirror_hwaccel
                    ? "GPU hwaccel (--mirror-hwaccel; D3D11VA resident surfaces)"
-                   : "software libavcodec (toggle GPU in OPTIONS panel)");
+                   : "software libavcodec (toggle GPU in Settings panel)");
 
-    // Live-mutable settings exposed to the overlay UI. Seed from the
-    // CLI defaults; the UI thread can change values at runtime, and
-    // /info reads them on every iPhone handshake (so changes take
-    // effect on the next reconnect).
     ap::airplay::LiveSettings live_settings;
     live_settings.set_receiver_name(saved.receiver_name);
     live_settings.mirror_width.store(mirror_w);
@@ -248,14 +205,10 @@ int main(int argc, char** argv) {
     live_settings.fullscreen.store(saved.fullscreen);
     live_settings.chromeless.store(saved.chromeless);
     live_settings.video_rotation.store(saved.video_rotation);
+    live_settings.auto_recover_seconds.store(saved.auto_recover_seconds);
     live_settings.set_ui_preferences(saved.ui);
     ctx.live = &live_settings;
-    LOG_INFO << "AirPlay Streaming HLS path: "
-             << (hls_playback ? "ENABLED (--hls-proxy-playback)"
-                              : "disabled (mirror + RAOP audio only)");
 
-    // Load (or create) the persistent Ed25519 identity. iOS caches receivers
-    // by pk — keeping a stable keypair avoids re-pairing on every launch.
     auto identity = ap::crypto::Identity::load_or_create("identity.key");
     if (!identity) {
         LOG_ERROR << "failed to initialise identity — aborting";
@@ -265,7 +218,7 @@ int main(int argc, char** argv) {
     ctx.public_key = identity->public_key();
     ctx.identity   = identity.get();
 
-    LOG_INFO << "=== AirPlay-Windows skeleton ===";
+    LOG_INFO << "=== WinAirPlay ===";
     LOG_INFO << "name="     << ctx.name;
     LOG_INFO << "deviceid=" << ctx.deviceid;
     const std::string local_ip   = ap::net::primary_ipv4();
@@ -276,16 +229,11 @@ int main(int argc, char** argv) {
     }
     LOG_INFO << "pk(Ed25519)=" << ctx.public_key.size() << " bytes";
 
-    // Start the SDL2 renderer window upfront. Streams will push decoded
-    // frames once an iPhone connects.
     ap::video::VideoRenderer renderer;
     renderer.set_live_settings(&live_settings);
-    if (!renderer.start("AirPlay-Windows", start_hidden)) {
+    if (!renderer.start(ap::kAppName)) {
         LOG_WARN << "VideoRenderer could not start — running headless";
     }
-    // Prefer the v4 address on the idle screen (shorter, more familiar),
-    // but fall back to v6 if we're on a v6-only network. Without this,
-    // an v6-only host would display "0.0.0.0" to the user.
     const std::string display_ip =
         (local_ip.empty() || local_ip == "0.0.0.0") && !local_ipv6.empty()
             ? local_ipv6 : local_ip;
@@ -302,31 +250,40 @@ int main(int argc, char** argv) {
         ap::net::global_shutdown();
         return 1;
     }
-    // Keep the render thread available while workers finish GPU/audio teardown.
+
+    ap::android::AndroidMirrorServer android_server;
+    android_server.attach_renderer(&renderer);
+    android_server.set_live_settings(&live_settings);
+    if (!android_server.start(7001)) {
+        LOG_WARN << "AndroidMirrorServer could not bind TCP 7001";
+    }
+
     std::atomic<bool> disconnect_requested{false};
+    std::atomic<bool> reconnect_requested{false};
     renderer.set_disconnect_handler([&disconnect_requested]() {
         disconnect_requested.store(true);
+    });
+    renderer.set_reconnect_handler([&reconnect_requested]() {
+        reconnect_requested.store(true);
+    });
+    renderer.set_android_connect_handler([&android_server](const std::string& target_ip) {
+        android_server.connect_wireless_async(target_ip);
     });
 
     struct AudioRequest { ap::airplay::MediaCommand command; uint32_t position; std::string session_id; };
     std::mutex audio_request_mutex;
-    std::deque<AudioRequest> audio_requests;
+    std::optional<AudioRequest> audio_request;
     renderer.set_audio_control_handler([&](ap::airplay::MediaCommand command, uint32_t position) {
         ap::video::VideoRenderer::DeviceInfo device;
         renderer.active_device_snapshot(device);
         std::lock_guard<std::mutex> lock(audio_request_mutex);
-        audio_requests.push_back({command, position, device.session_id});
+        audio_request = AudioRequest{command, position, device.session_id};
     });
 
-    // Local HTTP proxy + libavformat player only when the HLS path is
-    // opted into. In the default (mirror + RAOP) mode nothing connects
-    // to them anyway, but skipping the bind avoids the port claim and
-    // keeps a clean log.
     ap::airplay::HlsLocalServer hls_server;
     if (hls_playback) {
         if (!hls_server.start(7100)) {
-            LOG_WARN << "HLS local server could not bind 7100 — "
-                        "--hls-proxy-playback playback will not work";
+            LOG_WARN << "HLS local server could not bind 7100";
         }
         ctx.hls_local_port = hls_server.port();
     }
@@ -336,18 +293,17 @@ int main(int argc, char** argv) {
         LOG_WARN << "mDNS not available — receiver won't auto-appear on iOS";
     }
 
-    // Watch for USB-connected iPhones in parallel with the Wi-Fi mDNS
-    // path. Phase 1: just logs arrivals + paired/not-paired. The full
-    // QuickTime mirror session is layered on top in later phases —
-    // when ready, the supervisor will hand a connected device off to
-    // the same VideoRenderer / AudioOutput that mirror_listener uses.
     ap::usb::UsbSupervisor usb_supervisor;
+    usb_supervisor.attach_renderer(&renderer);
+    usb_supervisor.attach_android_server(&android_server);
     usb_supervisor.start();
 
     LOG_INFO << "Ready. Close the window or press Ctrl-C to exit.";
     auto last_saved_settings = ap::snapshot(live_settings);
-    auto observed_settings = last_saved_settings;
+    auto observed_settings   = last_saved_settings;
     auto settings_changed_at = std::chrono::steady_clock::now();
+    ap::airplay::LinkWatchdog link_watchdog;
+
     while (!g_stop && !renderer.user_closed()) {
 #if defined(_WIN32)
         if (instance.activation_requested()) renderer.request_show();
@@ -360,18 +316,62 @@ int main(int argc, char** argv) {
             if (!mdns.start(ctx, server.port()))
                 LOG_WARN << "Could not advertise the new receiver name";
         }
+
+        const bool link_active = renderer.mirror_link_active();
+        const int64_t last_rx  = renderer.mirror_last_rx_ns();
+        const int64_t now_ns   = ap::video::VideoRenderer::steady_now_ns();
+        const int timeout_s    = live_settings.auto_recover_seconds.load();
+
+        // Stage 1: Smart non-destructive probing & IDR keyframe flush during micro-stutters
+        bool should_probe = false;
+        const auto health = link_watchdog.evaluate(link_active, last_rx, now_ns, timeout_s, should_probe);
+        if (health == ap::airplay::LinkHealth::MicroStutter ||
+            health == ap::airplay::LinkHealth::Probing) {
+            renderer.set_reconnecting_overlay(true);
+            if (should_probe) {
+                server.probe_and_recover_clients();
+                android_server.request_keyframe_resync();
+            }
+        } else if (health == ap::airplay::LinkHealth::Healthy) {
+            renderer.set_reconnecting_overlay(false);
+        }
+
+        // Stage 2: Full session reset & Bonjour restart if the link stays dead past timeout_s
+        if (link_watchdog.poll(link_active, last_rx, now_ns, timeout_s)) {
+            LOG_WARN << "Auto-recovery: no data from the device for more than "
+                     << timeout_s
+                     << " s — resetting the session and restarting Bonjour";
+            server.disconnect_clients();
+            android_server.disconnect_active();
+            mdns.stop();
+            if (!mdns.start(ctx, server.port()))
+                LOG_WARN << "Auto-recovery: could not restart the Bonjour advertisement";
+            renderer.note_auto_recovery();
+            LOG_NOTICE << "Auto-recovery done: ready for a new connection";
+        }
+
+        // Manual Reconnect / Refresh Stream button on the Live Control Dock
+        if (reconnect_requested.exchange(false)) {
+            LOG_INFO << "Manual stream resync / reconnect requested from Control Dock";
+            if (!server.probe_and_recover_clients() && !android_server.is_streaming()) {
+                mdns.stop();
+                mdns.start(ctx, server.port());
+            } else {
+                android_server.request_keyframe_resync();
+            }
+        }
+
         if (disconnect_requested.exchange(false)) {
             LOG_INFO << "Disconnect requested by toolbar";
             server.disconnect_clients();
+            android_server.disconnect_active();
             LOG_INFO << "Disconnect completed: all client handlers drained";
         }
+
         std::optional<AudioRequest> request;
         {
             std::lock_guard<std::mutex> lock(audio_request_mutex);
-            if (!audio_requests.empty()) {
-                request = std::move(audio_requests.front());
-                audio_requests.pop_front();
-            }
+            request.swap(audio_request);
         }
         if (request) {
             const bool success = server.control_audio(request->command, request->position, request->session_id);
@@ -380,6 +380,7 @@ int main(int argc, char** argv) {
         ap::video::VideoRenderer::DeviceInfo current_device;
         renderer.active_device_snapshot(current_device);
         renderer.set_audio_control_available(server.audio_control_available(current_device.session_id));
+
         const auto current_settings = ap::snapshot(live_settings);
         const auto settings_now = std::chrono::steady_clock::now();
         if (!(current_settings == observed_settings)) {
@@ -396,8 +397,8 @@ int main(int argc, char** argv) {
 
     LOG_INFO << "Shutting down... (g_stop=" << g_stop.load()
              << " user_closed=" << renderer.user_closed() << ")";
-    // Withdraw discovery and interrupt sessions before stopping peripherals.
     server.stop();
+    android_server.stop();
     mdns.stop();
     usb_supervisor.stop();
     hls_player.stop();

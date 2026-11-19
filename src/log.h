@@ -5,7 +5,11 @@
 
 namespace ap {
 
-enum class LogLevel { Debug, Info, Warn, Error };
+// Notice = "important Info": session lifecycle and periodic health lines.
+// Warn, Error and Notice are also appended to a small log file (see log.cpp)
+// even when --log is not given, so a freeze that happened while nobody was
+// watching a console can still be analysed afterwards.
+enum class LogLevel { Debug, Info, Warn, Error, Notice };
 
 void log_write(LogLevel level, const std::string& msg);
 
@@ -14,6 +18,11 @@ void log_write(LogLevel level, const std::string& msg);
 // passes --log (or --verbose) on the command line.
 void set_log_enabled(bool on);
 bool is_log_enabled();
+
+// Redirect the persistent log file (empty path disables it). Normally not
+// needed: on Windows the default is %APPDATA%\WinAirPlay\winairplay.log;
+// elsewhere set the WINAIRPLAY_LOG_FILE environment variable to enable it.
+void set_log_file(const std::string& path);
 
 class LogStream {
 public:
@@ -33,7 +42,8 @@ private:
 
 } // namespace ap
 
-#define LOG_DEBUG ::ap::LogStream(::ap::LogLevel::Debug)
-#define LOG_INFO  ::ap::LogStream(::ap::LogLevel::Info)
-#define LOG_WARN  ::ap::LogStream(::ap::LogLevel::Warn)
-#define LOG_ERROR ::ap::LogStream(::ap::LogLevel::Error)
+#define LOG_DEBUG  ::ap::LogStream(::ap::LogLevel::Debug)
+#define LOG_INFO   ::ap::LogStream(::ap::LogLevel::Info)
+#define LOG_NOTICE ::ap::LogStream(::ap::LogLevel::Notice)
+#define LOG_WARN   ::ap::LogStream(::ap::LogLevel::Warn)
+#define LOG_ERROR  ::ap::LogStream(::ap::LogLevel::Error)
