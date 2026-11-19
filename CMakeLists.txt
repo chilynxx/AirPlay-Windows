@@ -11,7 +11,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(MSVC)
     add_compile_options(/W4 /permissive- /utf-8)
     add_definitions(-D_WIN32_WINNT=0x0A00 -DWIN32_LEAN_AND_MEAN -DNOMINMAX
-                    -D_CRT_SECURE_NO_WARNINGS)
+                    -D_CRT_SECURE_NO_WARNINGS -D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
