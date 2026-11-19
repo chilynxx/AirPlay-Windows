@@ -11,10 +11,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(MSVC)
     add_compile_options(/W4 /permissive- /utf-8)
     add_definitions(-D_WIN32_WINNT=0x0A00 -DWIN32_LEAN_AND_MEAN -DNOMINMAX
-                    -D_CRT_SECURE_NO_WARNINGS -D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
+                    -D_CRT_SECURE_NO_WARNINGS
+                    -D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
+
+include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # ---- libplist (required) ------------------------------------------------------
 set(LIBPLIST_TARGET "")
@@ -373,6 +376,12 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_RUNTIME_DLLS:WinAirPlay>
             $<TARGET_FILE_DIR:WinAirPlay>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:WinAirPlay>
+            $<TARGET_FILE_DIR:WinAirPlay>/WWinAirPlay.exe
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:WinAirPlay>
+            $<TARGET_FILE_DIR:WinAirPlay>/airplay-windows.exe
         COMMAND_EXPAND_LISTS
         COMMENT "Deploying linked runtime DLLs next to WinAirPlay.exe"
         VERBATIM)
