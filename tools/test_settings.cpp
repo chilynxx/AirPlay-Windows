@@ -1,6 +1,7 @@
 #include "settings.h"
 #include "airplay/live_settings.h"
 #include "audio/master_volume.h"
+#include "i18n/localization.h"
 #include <chrono>
 #include <fstream>
 #include <iostream>
@@ -16,6 +17,7 @@ int main() {
     try {
         ap::PersistentSettings wanted;
         require(wanted.mirror_hwaccel, "GPU acceleration must be the default");
+        require(wanted.receiver_name == "WinAirPlay", "default receiver name must be WinAirPlay");
         wanted.receiver_name = "Living room";
         wanted.mirror_width = 3840; wanted.mirror_height = 2160;
         wanted.mirror_hwaccel = true;
@@ -28,18 +30,26 @@ int main() {
         wanted.ui.recording_codec = 1;
         wanted.ui.recording_encoder = 2;
         wanted.ui.recording_bitrate = 24;
-        wanted.ui.wallpaper_path = "C:/Users/me/AppData/Roaming/AirPlay-Windows/wallpaper.png";
+        wanted.ui.wallpaper_path = "C:/Users/me/AppData/Roaming/WinAirPlay/wallpaper.png";
         wanted.ui.wallpaper_dim = 62;
         wanted.ui.accent = 2;
         wanted.ui.device_frame = true;
         wanted.ui.master_volume = 35;
         wanted.ui.muted = true;
+        wanted.ui.language = 1;
+        wanted.ui.dark_mode = false;
+        wanted.ui.connection_mode = 1;
+        wanted.ui.platform_mode = 1;
+        wanted.ui.android_ip = "192.168.1.88:5555";
         wanted.auto_recover_seconds = 15;
         require(ap::save_settings(wanted, path), "initial save failed");
         require(ap::load_settings(path) == wanted, "preferences lost on reload");
+        require(ap::i18n::current_language() == ap::i18n::Language::Vietnamese,
+                "Vietnamese language setting applied on load");
         wanted.ui.diagnostics = false;
         wanted.mirror_hwaccel = false;
         wanted.ui.recording_bitrate = 40;
+        wanted.ui.language = 0;
         require(ap::save_settings(wanted, path), "replacement save failed");
         require(ap::load_settings(path) == wanted, "replacement did not preserve preferences");
         ap::airplay::LiveSettings live;
@@ -61,15 +71,15 @@ int main() {
             renamed << "receiver_name=AirPlay-Windows\nauto_recover_seconds=0\nwallpaper_dim=500\n";
         }
         const auto migrated = ap::load_settings(path);
-        require(migrated.receiver_name == std::string(ap::kAppName), "old AirPlay-Windows default migrates to WWinAirPlay");
+        require(migrated.receiver_name == std::string(ap::kAppName), "old AirPlay-Windows default migrates to WinAirPlay");
         require(migrated.auto_recover_seconds == 0, "auto recovery can be switched off");
         require(migrated.ui.wallpaper_dim == 45, "out-of-range wallpaper dimming accepted");
         {
             std::ofstream previous(path);
-            previous << "receiver_name=WinAirPlay\n";
+            previous << "receiver_name=WWinAirPlay\n";
         }
         require(ap::load_settings(path).receiver_name == std::string(ap::kAppName),
-                "previous WinAirPlay default also migrates to WWinAirPlay");
+                "previous WWinAirPlay default also migrates to WinAirPlay");
         {
             std::ofstream invalid(path);
             invalid << "window_width=-5\nwindow_height=9999999\nrecording_codec=99\n"

@@ -30,11 +30,11 @@ std::atomic<bool> g_log_enabled{false};
 
 const char* level_tag(LogLevel lvl) {
     switch (lvl) {
-        case LogLevel::Debug: return "DEBUG";
-        case LogLevel::Info:  return "INFO ";
-        case LogLevel::Warn:  return "WARN ";
-        case LogLevel::Error: return "ERROR";
-        case LogLevel::Notice: return "INFO ";   // same text as before the log file existed
+        case LogLevel::Debug:  return "DEBUG";
+        case LogLevel::Info:   return "INFO ";
+        case LogLevel::Warn:   return "WARN ";
+        case LogLevel::Error:  return "ERROR";
+        case LogLevel::Notice: return "INFO ";
     }
     return "?";
 }
@@ -58,7 +58,7 @@ std::string timestamp() {
 
 // ---- persistent log file ---------------------------------------------------
 // Small, bounded and always on: Warn/Error/Notice lines only. One rotation
-// (airplay.log -> airplay.log.1) keeps the total under ~2 MiB.
+// (winairplay.log -> winairplay.log.1) keeps the total under ~2 MiB.
 constexpr std::uintmax_t kLogFileLimit = 1024 * 1024;
 
 struct FileSink {
@@ -96,9 +96,10 @@ std::filesystem::path default_log_path() {
     wchar_t buf[MAX_PATH];
     const DWORD n = GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return {};
-    return std::filesystem::path(buf) / L"AirPlay-Windows" / L"airplay.log";
+    return std::filesystem::path(buf) / L"WinAirPlay" / L"winairplay.log";
 #else
-    const char* env = std::getenv("AIRPLAY_LOG_FILE");
+    const char* env = std::getenv("WINAIRPLAY_LOG_FILE");
+    if (!env) env = std::getenv("AIRPLAY_LOG_FILE");
     return env ? std::filesystem::path(env) : std::filesystem::path();
 #endif
 }
@@ -119,7 +120,7 @@ bool open_sink(FileSink& s) {
     if (ec) s.written = 0;
     s.out.open(s.path, std::ios::app);
     if (!s.out.is_open()) { s.failed = true; return false; }
-    s.out << date_time_stamp() << "  ---- log opened ----\n";
+    s.out << date_time_stamp() << "  ---- WinAirPlay log opened ----\n";
     s.out.flush();
     return true;
 }

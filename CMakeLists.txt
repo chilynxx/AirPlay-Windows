@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(WWinAirPlay VERSION 0.4.1 LANGUAGES C CXX)
+project(WinAirPlay VERSION 0.5.0 LANGUAGES C CXX)
 if(WIN32)
     enable_language(RC)   # application icon and version information (assets/winairplay.rc)
 endif()
@@ -17,9 +17,6 @@ else()
 endif()
 
 # ---- libplist (required) ------------------------------------------------------
-# UxPlay uses libplist to serialise the /info, ANNOUNCE and other RTSP bodies.
-# We take the same dependency rather than writing a bplist00 encoder by hand.
-# Try three lookup paths in order (vcpkg / Linux pkg-config / raw find_*).
 set(LIBPLIST_TARGET "")
 
 find_package(PkgConfig QUIET)
@@ -41,9 +38,6 @@ if(NOT LIBPLIST_TARGET)
 endif()
 
 if(NOT LIBPLIST_TARGET)
-    # vcpkg doesn't ship a CMake config for libplist on all platforms — fall
-    # back to raw finders. With the vcpkg toolchain, CMAKE_PREFIX_PATH already
-    # points at vcpkg_installed/<triplet>/{include,lib}, so these just work.
     find_path(LIBPLIST_INCLUDE_DIR plist/plist.h)
     find_library(LIBPLIST_LIBRARY NAMES plist-2.0 libplist-2.0 plist libplist)
     if(LIBPLIST_INCLUDE_DIR AND LIBPLIST_LIBRARY)
@@ -57,14 +51,9 @@ if(NOT LIBPLIST_TARGET)
 endif()
 
 # ---- OpenSSL (required) -------------------------------------------------------
-# Used for Ed25519 identity keys, X25519 ECDH, AES-CTR and SHA-512 during the
-# AirPlay pair-setup / pair-verify handshake.
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
-# ---- FFmpeg (required for H.264 decoding) -------------------------------------
-# Uses libavcodec to decode the clear H.264 NAL units the mirror stream
-# produces after AES-CTR decrypt + AVCC→Annex-B conversion. libswscale is
-# for YUV→RGB conversion when dumping debug frames to PPM.
+# ---- FFmpeg (required for H.264/HEVC decoding) --------------------------------
 set(FFMPEG_TARGETS "")
 if(PkgConfig_FOUND)
     pkg_check_modules(AVCODEC  IMPORTED_TARGET libavcodec)
@@ -77,7 +66,6 @@ if(PkgConfig_FOUND)
     endif()
 endif()
 if(NOT FFMPEG_TARGETS)
-    # vcpkg path (Windows): use its FindFFMPEG module.
     find_package(FFMPEG QUIET)
     if(FFMPEG_FOUND)
         set(FFMPEG_TARGETS ${FFMPEG_LIBRARIES})
@@ -93,14 +81,6 @@ if(NOT FFMPEG_TARGETS)
 endif()
 
 # ---- SDL2 (required for the video renderer window) ----------------------------
-# Used by video/VideoRenderer to create a real-time window displaying the
-# decoded iPhone screen. On Windows we prefer the SDL2 CMake config that
-# vcpkg ships — it carries proper debug/release variants. pkg-config's
-# .pc files don't distinguish (vcpkg drops both debug and release into the
-# same PKG_CONFIG_PATH), so a Release build can pick up SDL2d.lib by
-# accident and the .exe ends up linked against the debug DLLs. Linux's
-# pkg-config has only one variant per system, so it stays the primary
-# search there.
 set(SDL2_TARGET "")
 if(NOT WIN32 AND PkgConfig_FOUND)
     pkg_check_modules(SDL2 IMPORTED_TARGET sdl2)
@@ -117,8 +97,6 @@ if(NOT SDL2_TARGET)
     endif()
 endif()
 if(NOT SDL2_TARGET AND PkgConfig_FOUND)
-    # Fallback: try pkg-config even on Windows if the CMake config
-    # is missing for some reason.
     pkg_check_modules(SDL2 IMPORTED_TARGET sdl2)
     if(SDL2_FOUND)
         set(SDL2_TARGET PkgConfig::SDL2)
@@ -132,9 +110,6 @@ if(NOT SDL2_TARGET)
 endif()
 
 # ---- SDL2_ttf (required for the metadata text overlay) ------------------------
-# Same debug/release trap as SDL2 above — prefer the vcpkg CMake config
-# on Windows so MSVC links against SDL2_ttf.lib (release) and not
-# SDL2_ttfd.lib (debug, the .pc-config-found-first failure mode).
 set(SDL2_TTF_TARGET "")
 if(NOT WIN32 AND PkgConfig_FOUND)
     pkg_check_modules(SDL2_TTF IMPORTED_TARGET SDL2_ttf)
@@ -164,16 +139,6 @@ if(NOT SDL2_TTF_TARGET)
 endif()
 
 # ---- GStreamer (preferred HLS backend if available) ---------------------------
-# We have two HLS backends:
-#   - GStreamer (hls_player_gstreamer.cpp) — handles HLS live-edge buffering,
-#     variant switching, HEVC mux gracefully.
-#   - libavformat (hls_player.cpp) — single-file, no extra runtime dep, but
-#     less robust on YouTube-style mlhls streams.
-#
-# USE_GSTREAMER_HLS = AUTO (default): pick GStreamer if pkg-config finds it,
-# else fall back to libavformat. ON forces GStreamer (errors if not found),
-# OFF forces libavformat. So a single `cmake build` directory does the right
-# thing on a developer machine that has GStreamer installed.
 set(USE_GSTREAMER_HLS "AUTO" CACHE STRING
     "HLS backend: AUTO (prefer GStreamer if found), ON (require it), OFF (libavformat)")
 set_property(CACHE USE_GSTREAMER_HLS PROPERTY STRINGS AUTO ON OFF)
@@ -182,30 +147,20 @@ set(_use_gst FALSE)
 if(USE_GSTREAMER_HLS STREQUAL "ON")
     set(_use_gst TRUE)
 elseif(USE_GSTREAMER_HLS STREQUAL "AUTO")
-    set(_use_gst TRUE)         # tentative — checked below
+    set(_use_gst TRUE)
 endif()
 if(_use_gst)
     if(NOT PkgConfig_FOUND)
         if(USE_GSTREAMER_HLS STREQUAL "ON")
             message(FATAL_ERROR "USE_GSTREAMER_HLS=ON requires pkg-config")
         endif()
-        message(STATUS "HLS backend: pkg-config missing → falling back to libavformat")
+        message(STATUS "HLS backend: pkg-config missing -> falling back to libavformat")
         set(_use_gst FALSE)
     endif()
 endif()
 if(_use_gst)
-    # Windows convenience: -DGSTREAMER_ROOT=... propagates into
-    # PKG_CONFIG_PATH. Accepts either:
-    #   - the install root:
-    #       C:/Program Files/gstreamer/1.0/msvc_x86_64
-    #   - the pkgconfig dir directly (which is already how pkg-config
-    #     wants it):
-    #       C:/Program Files/gstreamer/1.0/msvc_x86_64/lib/pkgconfig
-    # Normalises backslashes to '/' for CMake consumption.
     if(GSTREAMER_ROOT)
         string(REPLACE "\\" "/" _gst_root "${GSTREAMER_ROOT}")
-        # Accept any of: install root, .../lib, .../lib/pkgconfig, .../pkgconfig.
-        # Probe each candidate in turn for gstreamer-1.0.pc.
         set(_gst_pkg_dir "")
         foreach(_cand
                 "${_gst_root}"
@@ -219,7 +174,7 @@ if(_use_gst)
         endforeach()
         if(_gst_pkg_dir)
             message(STATUS "GSTREAMER_ROOT=${GSTREAMER_ROOT}")
-            message(STATUS "  → pkgconfig dir: ${_gst_pkg_dir}")
+            message(STATUS "  -> pkgconfig dir: ${_gst_pkg_dir}")
             if(WIN32)
                 set(ENV{PKG_CONFIG_PATH}
                     "${_gst_pkg_dir};$ENV{PKG_CONFIG_PATH}")
@@ -230,15 +185,7 @@ if(_use_gst)
         else()
             message(WARNING
                 "GSTREAMER_ROOT=${GSTREAMER_ROOT}\n"
-                "  gstreamer-1.0.pc not found under that path. Checked:\n"
-                "    ${_gst_root}\n"
-                "    ${_gst_root}/pkgconfig\n"
-                "    ${_gst_root}/lib/pkgconfig\n"
-                "    ${_gst_root}/lib\n"
-                "  On Windows the development files live under:\n"
-                "    C:/Program Files/gstreamer/1.0/msvc_x86_64/lib/pkgconfig\n"
-                "  If gstreamer-1.0.pc is missing entirely, re-run the MSI\n"
-                "  installer in Custom mode and enable the whole feature tree.")
+                "  gstreamer-1.0.pc not found under that path.")
         endif()
     endif()
     pkg_check_modules(GSTREAMER IMPORTED_TARGET
@@ -246,16 +193,9 @@ if(_use_gst)
     if(NOT GSTREAMER_FOUND)
         if(USE_GSTREAMER_HLS STREQUAL "ON")
             message(FATAL_ERROR
-                "USE_GSTREAMER_HLS=ON but gstreamer-1.0/gstreamer-app-1.0/gstreamer-video-1.0 not found.\n"
-                "  Windows: install GStreamer MSVC x86_64 from\n"
-                "           https://gstreamer.freedesktop.org/download/ and either\n"
-                "             set PKG_CONFIG_PATH before cmake, or pass\n"
-                "             -DGSTREAMER_ROOT=\"C:/Program Files/gstreamer/1.0/msvc_x86_64\"\n"
-                "  Linux:   apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev\n"
-                "                       libgstreamer-plugins-bad1.0-dev gstreamer1.0-libav\n"
-                "                       gstreamer1.0-plugins-good gstreamer1.0-plugins-bad")
+                "USE_GSTREAMER_HLS=ON but gstreamer-1.0/gstreamer-app-1.0/gstreamer-video-1.0 not found.")
         endif()
-        message(STATUS "HLS backend: GStreamer not found → using libavformat")
+        message(STATUS "HLS backend: GStreamer not found -> using libavformat")
         set(_use_gst FALSE)
     else()
         message(STATUS "HLS backend: GStreamer (${GSTREAMER_VERSION})")
@@ -268,11 +208,6 @@ if(NOT _use_gst)
 endif()
 
 # ---- Dear ImGui (in-app overlay UI) ------------------------------------------
-# Pinned vendored copy of Dear ImGui + the SDL2 / SDLRenderer2 backends. We
-# draw directly over the SDL renderer — zero IPC, zero frame copy, runs in
-# the same thread/GPU context as the video texture. The overlay gives us a
-# device sidebar, live stats, hotkeys config, recording HUD, etc., without
-# a webview.
 include(FetchContent)
 FetchContent_Declare(
     imgui
@@ -295,15 +230,15 @@ target_include_directories(imgui PUBLIC
     ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(imgui PUBLIC ${SDL2_TARGET})
 if(MSVC)
-    # Quiet the upstream warnings — we don't control imgui's source hygiene.
     target_compile_options(imgui PRIVATE /W0)
 endif()
 
 # ---- Sources ------------------------------------------------------------------
-add_executable(WWinAirPlay
+add_executable(WinAirPlay
     src/main.cpp
     src/log.cpp
     src/settings.cpp
+    src/i18n/localization.cpp
     src/net/socket.cpp
     src/net/tcp_server.cpp
     src/mdns/mdns_service.cpp
@@ -328,6 +263,7 @@ add_executable(WWinAirPlay
     src/airplay/hls_session.cpp
     src/airplay/reverse_channel.cpp
     src/airplay/routes.cpp
+    src/android/android_mirror.cpp
     src/video/h264_decoder.cpp
     src/video/gpu_video.cpp
     src/video/gpu_recording.cpp
@@ -335,6 +271,7 @@ add_executable(WWinAirPlay
     ${HLS_PLAYER_SRC}
     src/video/video_renderer.cpp
     src/platform/firewall.cpp
+    src/platform/desktop_controls.cpp
     src/video/cover_art.cpp
     src/video/image_loader.cpp
     src/audio/audio_receiver.cpp
@@ -344,35 +281,29 @@ add_executable(WWinAirPlay
     src/usb/usb_supervisor.cpp
 )
 
-target_include_directories(WWinAirPlay PRIVATE src third_party)
-target_link_libraries(WWinAirPlay PRIVATE OpenSSL::Crypto ${FFMPEG_TARGETS} ${SDL2_TARGET} ${SDL2_TTF_TARGET} imgui)
+target_include_directories(WinAirPlay PRIVATE src third_party)
+target_link_libraries(WinAirPlay PRIVATE OpenSSL::Crypto ${FFMPEG_TARGETS} ${SDL2_TARGET} ${SDL2_TTF_TARGET} imgui)
 if(_use_gst AND GSTREAMER_FOUND)
-    target_link_libraries(WWinAirPlay PRIVATE PkgConfig::GSTREAMER)
-    target_compile_definitions(WWinAirPlay PRIVATE HAVE_GSTREAMER_HLS=1)
+    target_link_libraries(WinAirPlay PRIVATE PkgConfig::GSTREAMER)
+    target_compile_definitions(WinAirPlay PRIVATE HAVE_GSTREAMER_HLS=1)
 endif()
 if(DEFINED FFMPEG_INCLUDE_DIRS_OK)
-    target_include_directories(WWinAirPlay PRIVATE ${FFMPEG_INCLUDE_DIRS_OK})
+    target_include_directories(WinAirPlay PRIVATE ${FFMPEG_INCLUDE_DIRS_OK})
 endif()
 
 # ---- FairPlay SAP blobs (swap-ready) ------------------------------------------
-# By default we link the zero-filled stub. If the user drops a real blob
-# file into third_party/ (conventionally named fairplay_blobs_real.cpp),
-# we link that instead. See docs/FAIRPLAY.md.
 if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/fairplay_blobs_real.cpp")
     message(STATUS "FairPlay: using provisioned blob (fairplay_blobs_real.cpp)")
-    target_sources(WWinAirPlay PRIVATE
+    target_sources(WinAirPlay PRIVATE
         third_party/fairplay_blobs_real.cpp)
 else()
     message(STATUS "FairPlay: using zero-filled STUB — iOS handshake will "
                    "fail at /fp-setup until a real blob is provided")
-    target_sources(WWinAirPlay PRIVATE
+    target_sources(WinAirPlay PRIVATE
         third_party/fairplay_blobs_stub.cpp)
 endif()
 
 # ---- playfair (level-B FairPlay decrypt, swap-ready) --------------------------
-# If third_party/playfair/ exists (copied from UxPlay's lib/playfair/), compile
-# and link its C files so fairplay_decrypt(ekey) can recover the AES stream key.
-# Without it, decryption is disabled and we only log the encrypted NAL units.
 if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/playfair/playfair.c")
     message(STATUS "playfair: using provisioned decryption library")
     set(_playfair_srcs
@@ -381,17 +312,12 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/playfair/playfair.c")
         third_party/playfair/omg_hax.c
         third_party/playfair/modified_md5.c
         third_party/playfair/sap_hash.c)
-    target_sources(WWinAirPlay PRIVATE ${_playfair_srcs})
-    # UxPlay's source uses `#include "playfair/playfair.h"` from fairplay_playfair.c
-    # and `#include "playfair.h"` from within playfair/*.c, so we expose both.
-    target_include_directories(WWinAirPlay PRIVATE
+    target_sources(WinAirPlay PRIVATE ${_playfair_srcs})
+    target_include_directories(WinAirPlay PRIVATE
         third_party
         third_party/playfair)
-    target_compile_definitions(WWinAirPlay PRIVATE HAVE_PLAYFAIR=1)
+    target_compile_definitions(WinAirPlay PRIVATE HAVE_PLAYFAIR=1)
 
-    # Quiet down playfair's legacy-C warnings (intentional byte truncations,
-    # unused-variable debug leftovers, a spurious C4701 in modified_md5.c).
-    # We keep our own source compiled at /W4 to catch real issues.
     if(MSVC)
         set_source_files_properties(${_playfair_srcs} PROPERTIES
             COMPILE_FLAGS "/wd4100 /wd4101 /wd4189 /wd4244 /wd4305 /wd4701")
@@ -405,37 +331,25 @@ endif()
 
 if(LIBPLIST_TARGET)
     message(STATUS "libplist: linking via ${LIBPLIST_TARGET}")
-    target_link_libraries(WWinAirPlay PRIVATE ${LIBPLIST_TARGET})
-    target_compile_definitions(WWinAirPlay PRIVATE HAVE_LIBPLIST=1)
+    target_link_libraries(WinAirPlay PRIVATE ${LIBPLIST_TARGET})
+    target_compile_definitions(WinAirPlay PRIVATE HAVE_LIBPLIST=1)
 else()
     message(FATAL_ERROR
         "libplist not found. Required for the /info binary plist — iOS will "
-        "reject the handshake without it.\n"
-        "  Windows: re-run cmake with -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/"
-        "buildsystems/vcpkg.cmake (vcpkg.json declares the dep).\n"
-        "  Linux:   apt install libplist-dev")
+        "reject the handshake without it.")
 endif()
 
 if(WIN32)
-    # ws2_32: Winsock; iphlpapi: GetAdaptersAddresses; dnsapi: native mDNS;
-    # dwmapi: DwmSetWindowAttribute for the Win11 Mica backdrop on the
-    # VideoRenderer window.
-    target_link_libraries(WWinAirPlay PRIVATE
+    target_link_libraries(WinAirPlay PRIVATE
         ws2_32 iphlpapi dnsapi dwmapi d3d11
-        setupapi shell32 ole32 oleaut32)   # USB, Lockdown lookup and firewall COM API
+        setupapi shell32 ole32 oleaut32 windowsapp)
 
-    # Released as a GUI app so no empty console window pops up when
-    # launched from File Explorer. main() stays the entry point — the
-    # /ENTRY override avoids having to add a WinMain stub.
-    set_target_properties(WWinAirPlay PROPERTIES WIN32_EXECUTABLE TRUE)
-    # Product identity and output executable are both WWinAirPlay.
-    target_sources(WWinAirPlay PRIVATE assets/winairplay.rc)
-    # RC resolves resource file names through its include paths; include assets
-    # so the relative winairplay.ico reference works on clean Windows runners.
+    set_target_properties(WinAirPlay PROPERTIES WIN32_EXECUTABLE TRUE)
+    target_sources(WinAirPlay PRIVATE assets/winairplay.rc)
     set_source_files_properties(assets/winairplay.rc PROPERTIES
         INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/assets")
     if(MSVC)
-        target_link_options(WWinAirPlay PRIVATE "/ENTRY:mainCRTStartup")
+        target_link_options(WinAirPlay PRIVATE "/ENTRY:mainCRTStartup")
     endif()
 endif()
 
@@ -454,41 +368,28 @@ if(WIN32 AND BUILD_GPU_TESTS)
         COMMAND_EXPAND_LISTS)
 endif()
 
-# Use $<TARGET_RUNTIME_DLLS:WWinAirPlay> (CMake 3.21+) to copy ONLY
-# the shared libraries the linker actually depends on transitively —
-# pulls SDL2.dll, SDL2_ttf.dll, avcodec-*.dll, libplist-*.dll,
-# gstreamer-1.0-0.dll, gstapp-*.dll, glib-2.0-0.dll, … without dragging
-# along .pdb files, gst-launch-1.0.exe, ffmpeg.exe, the static .lib
-# imports, headers, plugins, etc. — which were swelling the build dir
-# past 900 MB with the previous copy_directory_if_different approach.
-#
-# GStreamer plugins (lib/gstreamer-1.0/*.dll) load dynamically at run
-# time and are NOT in TARGET_RUNTIME_DLLS. We keep them where the
-# system GStreamer install put them and let gst_init() find them via
-# its registered plugin path — practically: as long as the user has
-# GStreamer's bin/ on PATH the plugins resolve at startup.
 if(WIN32)
-    add_custom_command(TARGET WWinAirPlay POST_BUILD
+    add_custom_command(TARGET WinAirPlay POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_RUNTIME_DLLS:WWinAirPlay>
-            $<TARGET_FILE_DIR:WWinAirPlay>
+            $<TARGET_RUNTIME_DLLS:WinAirPlay>
+            $<TARGET_FILE_DIR:WinAirPlay>
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:WinAirPlay>
+            $<TARGET_FILE_DIR:WinAirPlay>/WWinAirPlay.exe
         COMMAND_EXPAND_LISTS
-        COMMENT "Deploying linked runtime DLLs next to WWinAirPlay.exe"
+        COMMENT "Deploying linked runtime DLLs next to WinAirPlay.exe"
         VERBATIM)
 endif()
 
 # ---- Avahi (optional, Linux only — dev-mode mDNS) ----------------------------
-# Lets the receiver auto-appear on iOS when launched from a Linux host for
-# hacking / testing. Windows uses the native dnsapi above.
 if(NOT WIN32 AND PkgConfig_FOUND)
     pkg_check_modules(AVAHI_CLIENT IMPORTED_TARGET avahi-client)
     if(AVAHI_CLIENT_FOUND)
-        target_link_libraries(WWinAirPlay PRIVATE PkgConfig::AVAHI_CLIENT)
-        target_compile_definitions(WWinAirPlay PRIVATE HAVE_AVAHI=1)
+        target_link_libraries(WinAirPlay PRIVATE PkgConfig::AVAHI_CLIENT)
+        target_compile_definitions(WinAirPlay PRIVATE HAVE_AVAHI=1)
         message(STATUS "Avahi: linking via PkgConfig::AVAHI_CLIENT")
     else()
-        message(STATUS "Avahi: not found — mDNS disabled on this Linux build "
-                       "(apt install libavahi-client-dev)")
+        message(STATUS "Avahi: not found — mDNS disabled on this Linux build")
     endif()
 endif()
 
@@ -500,7 +401,8 @@ if(BUILD_NETWORK_TESTS)
     if(WIN32)
         target_link_libraries(test-firewall PRIVATE shell32 ole32 oleaut32)
     endif()
-    add_executable(test-settings tools/test_settings.cpp src/settings.cpp src/log.cpp)
+    add_executable(test-settings tools/test_settings.cpp src/settings.cpp
+        src/i18n/localization.cpp src/log.cpp)
     target_include_directories(test-settings PRIVATE src)
     if(WIN32)
         target_link_libraries(test-settings PRIVATE shell32 ole32)
@@ -534,12 +436,7 @@ if(BUILD_NETWORK_TESTS)
     set_tests_properties(socket-shutdown PROPERTIES TIMEOUT 25)
 endif()
 
-# Long-session stability tests (opt-in so a normal build never depends on them):
-# duplicate filter, sound-device watchdog, decoder recovery and the whole mirror
-# receive path. The last two need an FFmpeg with the libx264 encoder and skip
-# themselves otherwise.
 option(BUILD_STABILITY_TESTS "Build the long-session stability tests" OFF)
-# Never let a missing test file break the build of the application itself.
 set(_stability_files
     tools/test_seq_dedup.cpp tools/test_audio_output.cpp
     tools/test_decoder_recovery.cpp tools/test_mirror_pipeline.cpp

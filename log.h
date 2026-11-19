@@ -20,8 +20,8 @@ void set_log_enabled(bool on);
 bool is_log_enabled();
 
 // Redirect the persistent log file (empty path disables it). Normally not
-// needed: on Windows the default is %APPDATA%\AirPlay-Windows\airplay.log;
-// elsewhere set the AIRPLAY_LOG_FILE environment variable to enable it.
+// needed: on Windows the default is %APPDATA%\WinAirPlay\winairplay.log;
+// elsewhere set the WINAIRPLAY_LOG_FILE environment variable to enable it.
 void set_log_file(const std::string& path);
 
 class LogStream {
@@ -42,8 +42,8 @@ private:
 
 } // namespace ap
 
-#define LOG_DEBUG ::ap::LogStream(::ap::LogLevel::Debug)
-#define LOG_INFO  ::ap::LogStream(::ap::LogLevel::Info)
+#define LOG_DEBUG  ::ap::LogStream(::ap::LogLevel::Debug)
+#define LOG_INFO   ::ap::LogStream(::ap::LogLevel::Info)
 #define LOG_NOTICE ::ap::LogStream(::ap::LogLevel::Notice)
-#define LOG_WARN  ::ap::LogStream(::ap::LogLevel::Warn)
-#define LOG_ERROR ::ap::LogStream(::ap::LogLevel::Error)
+#define LOG_WARN   ::ap::LogStream(::ap::LogLevel::Warn)
+#define LOG_ERROR  ::ap::LogStream(::ap::LogLevel::Error)

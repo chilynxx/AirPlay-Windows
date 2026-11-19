@@ -1,6 +1,7 @@
 #include "settings.h"
 #include "airplay/live_settings.h"
 #include "airplay/receiver_name.h"
+#include "i18n/localization.h"
 #include "log.h"
 
 #include <fstream>
@@ -22,7 +23,7 @@ std::filesystem::path settings_path() {
     }
     std::filesystem::path base(wide_path);
     CoTaskMemFree(wide_path);
-    return base / L"AirPlay-Windows" / L"settings.ini";
+    return base / L"WinAirPlay" / L"settings.ini";
 #else
     return {};
 #endif
@@ -33,10 +34,22 @@ PersistentSettings load_settings(const std::filesystem::path& path) {
     if (path.empty()) return s;
 
     std::ifstream in(path);
+#if defined(_WIN32)
+    // Seamless upgrade path: if %APPDATA%\WinAirPlay\settings.ini does not exist yet
+    // and the caller requested the default settings_path(), try the legacy directory.
+    if (!in.is_open() && path == settings_path()) {
+        std::error_code ec;
+        const auto legacy_path = path.parent_path().parent_path() / L"AirPlay-Windows" / L"settings.ini";
+        if (std::filesystem::exists(legacy_path, ec)) {
+            in.open(legacy_path);
+        }
+    }
+#endif
     if (!in.is_open()) return s;
 
     std::string line;
     while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         auto eq = line.find('=');
         if (eq == std::string::npos) continue;
@@ -123,6 +136,30 @@ PersistentSettings load_settings(const std::filesystem::path& path) {
                 const int n = std::stoi(val);
                 if (n >= 2 && n <= 40) s.ui.recording_bitrate = n;
             }
+            else if (key == "language") {
+                if (val == "vi" || val == "VI") {
+                    s.ui.language = 1;
+                } else if (val == "en" || val == "EN") {
+                    s.ui.language = 0;
+                } else {
+                    const int n = std::stoi(val);
+                    if (n >= 0 && n <= 1) s.ui.language = n;
+                }
+            }
+            else if (key == "dark_mode") {
+                s.ui.dark_mode = std::stoi(val) != 0;
+            }
+            else if (key == "connection_mode") {
+                const int n = std::stoi(val);
+                if (n >= 0 && n <= 1) s.ui.connection_mode = n;
+            }
+            else if (key == "platform_mode") {
+                const int n = std::stoi(val);
+                if (n >= 0 && n <= 1) s.ui.platform_mode = n;
+            }
+            else if (key == "android_ip") {
+                s.ui.android_ip = val;
+            }
         } catch (...) {
             LOG_WARN << "settings: malformed value for " << key << "=" << val;
         }
@@ -132,6 +169,8 @@ PersistentSettings load_settings(const std::filesystem::path& path) {
         s.receiver_name == kPreviousReceiverName) {
         s.receiver_name = kAppName;
     }
+    ap::i18n::LocalizationManager::instance().set_language(
+        static_cast<ap::i18n::Language>(s.ui.language));
     LOG_INFO << "settings: loaded from " << path.u8string();
     return s;
 }
@@ -182,7 +221,12 @@ bool save_settings(const PersistentSettings& s, const std::filesystem::path& pat
         << "recording_directory=" << s.ui.recording_directory << '\n'
         << "recording_codec=" << s.ui.recording_codec << '\n'
         << "recording_encoder=" << s.ui.recording_encoder << '\n'
-        << "recording_bitrate=" << s.ui.recording_bitrate << '\n';
+        << "recording_bitrate=" << s.ui.recording_bitrate << '\n'
+        << "language=" << s.ui.language << '\n'
+        << "dark_mode=" << (s.ui.dark_mode ? 1 : 0) << '\n'
+        << "connection_mode=" << s.ui.connection_mode << '\n'
+        << "platform_mode=" << s.ui.platform_mode << '\n'
+        << "android_ip=" << s.ui.android_ip << '\n';
     out.close();
     if (!out) {
         LOG_WARN << "settings: could not finish writing " << temporary.u8string();
