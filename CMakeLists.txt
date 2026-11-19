@@ -373,9 +373,6 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_RUNTIME_DLLS:WinAirPlay>
             $<TARGET_FILE_DIR:WinAirPlay>
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:WinAirPlay>
-            $<TARGET_FILE_DIR:WinAirPlay>/WWinAirPlay.exe
         COMMAND_EXPAND_LISTS
         COMMENT "Deploying linked runtime DLLs next to WinAirPlay.exe"
         VERBATIM)
