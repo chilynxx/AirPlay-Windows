@@ -349,7 +349,7 @@ void MirrorListener::accept_loop() {
         } else if (peer.ss_family == AF_INET) {
             auto* in4 = reinterpret_cast<sockaddr_in*>(&peer);
             inet_ntop(AF_INET, &in4->sin_addr, ip, sizeof(ip));
-            peer_port = ntohs(in4->sin6_port);
+            peer_port = ntohs(in4->sin_port);
         }
         LOG_NOTICE << "mirror: iOS connected from " << ip << ':' << peer_port;
 
