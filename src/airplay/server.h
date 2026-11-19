@@ -17,6 +17,12 @@ public:
     // RTSP — all unwound by the natural EOF cascade once the RTSP
     // TCP closes. Listener stays up so iOS can re-pair / re-mirror.
     void disconnect_clients();
+
+    // Non-destructive self-healing probe: sends an RTSP keep-alive
+    // GET_PARAMETER on active reverse/event channels and triggers an
+    // immediate H.264/HEVC decoder IDR keyframe flush on active mirror sessions.
+    bool probe_and_recover_clients();
+
     bool audio_control_available(const std::string& session_id);
     bool control_audio(MediaCommand command, uint32_t position_ms, const std::string& session_id);
 
@@ -25,6 +31,7 @@ private:
 
     std::mutex remotes_mutex_;
     std::map<socket_t, std::shared_ptr<DacpRemote>> remotes_;
+    std::map<socket_t, ClientSession*> active_sessions_;
     DeviceContext ctx_;
     ap::net::TcpServer tcp_;
 };

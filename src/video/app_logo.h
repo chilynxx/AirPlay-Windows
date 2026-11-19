@@ -1,5 +1,5 @@
 #pragma once
-// The WWinAirPlay logo (192x192 PNG with alpha), embedded so the interface does
+// The WinAirPlay logo (192x192 PNG with alpha), embedded so the interface does
 // not depend on files next to the executable. Generated from assets/winairplay-192.png:
 //   python tools/embed_logo.py
 #include <cstddef>

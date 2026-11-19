@@ -2,8 +2,11 @@
 #include "airplay/h264_nal.h"
 #include "airplay/h264_sps.h"
 #include "log.h"
+#include "platform/thread_tuning.h"
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <map>
 #include <sstream>
@@ -32,6 +35,9 @@ constexpr int kHeaderSize       = 128;
 constexpr int kMaxPayloadSize   = 2'000'000;   // generous bound vs RAOP_PACKET_LEN (32 KB)
 constexpr auto kRecvTimeoutMs   = 200;         // per-recv timeout; loops check running_
 
+// Converted-frame failures in a row (renderer side) before leaving the GPU path.
+constexpr int  kGpuConvertFailuresBeforeFallback = 20;
+
 enum : uint16_t {
     kFrameVideoNonIdr   = 0x0000,
     kFrameVideoIdr      = 0x0010,
@@ -58,12 +64,6 @@ uint32_t get_u32_le(const unsigned char* b, int off) {
          | (static_cast<uint32_t>(b[off + 3]) << 24);
 }
 
-// Search the SPS_PPS payload for the fourcc of an inner config box,
-// returning the offset of the first byte of the box content (after
-// the 8-byte size+type header) or std::string::npos. iOS HEVC mirror
-// wraps the hvcC config in an MP4 VisualSampleEntry; this lets the
-// logger surface the wrapped form without duplicating the decoder's
-// unwrap logic.
 std::size_t find_inner_box_offset(const std::vector<unsigned char>& payload,
                                   const char fourcc[4]) {
     for (std::size_t i = 4; i + 4 <= payload.size(); ++i) {
@@ -77,24 +77,6 @@ std::size_t find_inner_box_offset(const std::vector<unsigned char>& payload,
     return std::string::npos;
 }
 
-// SPS_PPS packet payload — for H.264 mirror it's the raw AVCC "avcC"
-// configuration record:
-//
-//   [0]    configurationVersion = 1
-//   [1]    AVCProfileIndication
-//   [2]    profile_compatibility
-//   [3]    AVCLevelIndication
-//   [4]    reserved(6)=1 + lengthSizeMinusOne(2)
-//   [5]    reserved(3)=1 + numOfSequenceParameterSets(5)
-//   [6..7] sequenceParameterSetLength (BE uint16)  ← assumes numSPS >= 1
-//   [8..]  SPS NAL bytes (incl. 1-byte NAL header)
-//   then:  numOfPictureParameterSets, ppsLength(BE16), PPS NAL
-//
-// For HEVC mirror the payload is an MP4 VisualSampleEntry ("hvc1")
-// wrapping an "hvcC" inner box. We log a one-liner with codec +
-// payload size in that case — the decoder will unwrap and parse the
-// real config separately, so duplicating that work here just for a
-// log line isn't worth it.
 bool log_sps_from_sps_pps_payload(const std::vector<unsigned char>& payload) {
     if (payload.size() < 8) {
         LOG_WARN << "mirror: SPS/PPS payload too short ("
@@ -102,7 +84,6 @@ bool log_sps_from_sps_pps_payload(const std::vector<unsigned char>& payload) {
         return false;
     }
     if (payload[0] == 0x01) {
-        // Raw avcC (the legacy H.264 mirror path).
         const uint8_t num_sps = payload[5] & 0x1f;
         if (num_sps == 0) {
             LOG_WARN << "mirror: avcC declares 0 SPS";
@@ -129,8 +110,6 @@ bool log_sps_from_sps_pps_payload(const std::vector<unsigned char>& payload) {
                  << (info.interlaced ? " (interlaced)" : "");
         return true;
     }
-    // First byte != 0x01: probably an MP4-wrapped sample entry. Look
-    // for an inner avcC or hvcC box and surface a corresponding line.
     if (find_inner_box_offset(payload, "hvcC") != std::string::npos) {
         LOG_INFO << "mirror video: HEVC (hvcC config wrapped in "
                  << payload.size() << "B SampleEntry)";
@@ -184,18 +163,26 @@ bool was_timeout() {
 #endif
 }
 
-// Returns len on success, 0 on peer close, -1 on real error.
-// Honours running_ flag by checking between recv calls (SO_RCVTIMEO caps each
-// individual recv at kRecvTimeoutMs).
-template <typename RunningFn>
-int recv_exact(socket_t s, unsigned char* buf, int len, RunningFn running) {
+template <typename RunningFn, typename TimeoutFn, typename DataFn>
+int recv_exact(socket_t s, unsigned char* buf, int len, RunningFn running,
+               std::chrono::steady_clock::time_point& last_rx,
+               TimeoutFn on_timeout, DataFn on_data) {
     int got = 0;
     while (got < len) {
         if (!running()) return -1;
         int n = ::recv(s, reinterpret_cast<char*>(buf + got), len - got, 0);
-        if (n > 0) { got += n; continue; }
+        if (n > 0) {
+            got += n;
+            last_rx = std::chrono::steady_clock::now();
+            on_data();
+            continue;
+        }
         if (n == 0) return 0;                 // peer closed
-        if (was_timeout() && running()) continue;
+        if (was_timeout()) {
+            if (!running()) return -1;
+            if (!on_timeout()) return -2;
+            continue;
+        }
         return -1;                             // real error, or stop requested
     }
     return got;
@@ -228,15 +215,8 @@ bool MirrorListener::enable_decrypt(
 }
 
 bool MirrorListener::start(uint16_t& port) {
-    // Dual-stack IPv6 listener so iOS reaches the mirror port whether
-    // it chose to connect over v4 or v6. This matches what the main
-    // TCP server and UDP audio sockets do; the previous IPv4-only
-    // bind silently dropped every v6 connect attempt, giving audio
-    // only (which uses a separate UDP socket) when the iPhone reached
-    // us via IPv6.
     listen_sock_ = ::socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (listen_sock_ == INVALID_SOCK) {
-        // Kernel without IPv6: fall back to v4.
         listen_sock_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (listen_sock_ == INVALID_SOCK) {
             LOG_ERROR << "mirror: TCP socket() failed";
@@ -322,14 +302,13 @@ void MirrorListener::stop() {
 #endif
         }
     }
-    // select() has a 100 ms timeout. Keep the listener valid until its
-    // thread exits rather than racing close()/descriptor reuse with select().
     if (thread_.joinable()) thread_.join();
     ap::net::close_socket(listen_sock_);
     listen_sock_ = INVALID_SOCK;
 }
 
 void MirrorListener::accept_loop() {
+    ap::platform::raise_current_thread_priority();
     while (running_) {
         fd_set rfds; FD_ZERO(&rfds); FD_SET(listen_sock_, &rfds);
         timeval tv; tv.tv_sec = 0; tv.tv_usec = 100000;
@@ -337,8 +316,6 @@ void MirrorListener::accept_loop() {
         if (ret <= 0) continue;
         if (listen_sock_ == INVALID_SOCK) break;
 
-        // sockaddr_storage covers both AF_INET and AF_INET6 without a
-        // preliminary branch. Format the peer address after accept.
         sockaddr_storage peer{};
 #if defined(_WIN32)
         int plen = sizeof(peer);
@@ -372,11 +349,13 @@ void MirrorListener::accept_loop() {
         } else if (peer.ss_family == AF_INET) {
             auto* in4 = reinterpret_cast<sockaddr_in*>(&peer);
             inet_ntop(AF_INET, &in4->sin_addr, ip, sizeof(ip));
-            peer_port = ntohs(in4->sin_port);
+            peer_port = ntohs(in4->sin6_port);
         }
-        LOG_INFO << "mirror: iOS connected from " << ip << ':' << peer_port;
+        LOG_NOTICE << "mirror: iOS connected from " << ip << ':' << peer_port;
 
         set_recv_timeout(client, kRecvTimeoutMs);
+        if (!ap::net::enable_tcp_keepalive(client, 10, 3, 6))
+            LOG_WARN << "mirror: could not enable TCP keepalive";
 
         reader_loop(client);
 
@@ -399,9 +378,124 @@ void MirrorListener::reader_loop(socket_t client) {
 
     auto running_fn = [this]() -> bool { return running_.load(); };
 
+    struct LinkGuard {
+        ap::video::VideoRenderer* renderer;
+        ~LinkGuard() { if (renderer) renderer->end_mirror_link(); }
+    } link_guard{renderer_};
+    if (renderer_) renderer_->begin_mirror_link();
+    auto on_data = [this]() { if (renderer_) renderer_->note_mirror_data(); };
+
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point last_rx          = Clock::now();
+    Clock::time_point last_health      = last_rx;
+    uint64_t          health_frames    = 0;
+    uint64_t          health_bytes     = 0;
+    uint64_t          unknown_types    = 0;
+    uint64_t          malformed_frames = 0;
+    uint64_t          prev_decoded     = 0;
+    uint64_t          prev_fed         = 0;
+    uint64_t          win_video = 0, win_idr = 0, win_cfg = 0, win_hb = 0,
+                      win_report = 0, win_other = 0;
+    uint64_t          pics_seen        = 0;
+    Clock::time_point pic_time         = last_rx;
+    bool              pic_stalled      = false;
+    int64_t           next_stall_ms    = 0;
+    uint64_t          since_pic_video  = 0, since_pic_other = 0;
+
+    auto health = [&]() {
+        const auto now = Clock::now();
+        if (now - last_health < std::chrono::milliseconds(health_period_ms_.load())) return;
+        const double secs = std::chrono::duration<double>(now - last_health).count();
+        last_health = now;
+        std::ostringstream os;
+        os << "health: mirror rx " << health_frames << " frames "
+           << (health_bytes / 1024) << " KB in " << static_cast<int>(secs) << " s"
+           << ", last data "
+           << std::chrono::duration_cast<std::chrono::milliseconds>(now - last_rx).count()
+           << " ms ago";
+        if (decoder_) {
+            const auto st = decoder_->stats();
+            os << "; decoder " << (decoder_->using_hardware() ? "GPU" : "CPU")
+               << " frames=" << st.frames << " (+" << (st.frames - prev_decoded) << ')'
+               << " errors=" << st.errors << " resyncs=" << st.resyncs
+               << " skipped=" << st.skipped
+               << " ms avg/max=" << static_cast<int>(st.avg_ms) << '/' << static_cast<int>(st.max_ms);
+            os << " fed=" << (st.packets - prev_fed);
+            prev_decoded = st.frames;
+            prev_fed     = st.packets;
+        }
+        os << "; sender sent video=" << win_video << " (idr=" << win_idr << ")"
+           << " cfg=" << win_cfg << " heartbeat=" << win_hb
+           << " report=" << win_report << " other=" << win_other;
+        if (renderer_) {
+            os << "; display shown=" << renderer_->frames_presented()
+               << " replaced=" << renderer_->frames_replaced()
+               << " gpu_fail=" << renderer_->gpu_convert_failures();
+        }
+        if (malformed_frames) os << "; malformed=" << malformed_frames;
+        LOG_NOTICE << os.str();
+        health_frames = 0;
+        health_bytes  = 0;
+        win_video = win_idr = win_cfg = win_hb = win_report = win_other = 0;
+    };
+
+    auto video_watch = [&]() {
+        const auto now = Clock::now();
+        const uint64_t pics = decoded_frames_.load(std::memory_order_relaxed);
+        if (pics != pics_seen) {
+            if (pic_stalled) {
+                LOG_NOTICE << "mirror: pictures resumed after "
+                           << static_cast<int>(std::chrono::duration<double>(now - pic_time).count())
+                           << " s";
+            }
+            pics_seen = pics;
+            pic_time = now;
+            pic_stalled = false;
+            next_stall_ms = 0;
+            since_pic_video = since_pic_other = 0;
+            return;
+        }
+        if (pics == 0) return;   // nothing has been shown yet
+        const int64_t idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - pic_time).count();
+        if (next_stall_ms == 0)
+            next_stall_ms = std::max<int64_t>(1, stall_warn_ms_.load());
+        if (idle_ms >= next_stall_ms) {
+            pic_stalled = true;
+            LOG_WARN << "mirror: no new picture for " << idle_ms / 1000.0
+                     << " s although the sender is connected (video frames received meanwhile: "
+                     << since_pic_video << ", other frames: " << since_pic_other
+                     << "). A static screen does this; otherwise the iPhone stopped sending video.";
+            next_stall_ms = next_stall_ms < 60'000 ? 60'000
+                          : (next_stall_ms < 300'000 ? 300'000 : next_stall_ms + 900'000);
+        }
+    };
+
+    auto check_manual_resync = [&]() {
+        if (idr_resync_requested_.exchange(false, std::memory_order_acq_rel)) {
+            if (decoder_) {
+                decoder_->resync("smart auto-reconnect IDR keyframe flush");
+            }
+        }
+    };
+
+    auto on_timeout = [&]() -> bool {
+        check_manual_resync();
+        health();
+        video_watch();
+        const auto limit = std::chrono::milliseconds(idle_limit_ms_.load());
+        if (Clock::now() - last_rx > limit) {
+            LOG_WARN << "mirror: no data from the sender for "
+                     << limit.count() / 1000.0 << " s — closing the stream";
+            return false;
+        }
+        return true;
+    };
+
     while (running_) {
-        int n = recv_exact(client, header.data(), kHeaderSize, running_fn);
-        if (n == 0) { LOG_INFO << "mirror: iOS closed stream"; break; }
+        check_manual_resync();
+        int n = recv_exact(client, header.data(), kHeaderSize, running_fn, last_rx, on_timeout, on_data);
+        if (n == 0) { LOG_NOTICE << "mirror: iOS closed stream"; break; }
+        if (n == -2) break;
         if (n < 0)  { LOG_WARN << "mirror: header recv error";  break; }
 
         uint32_t payload_size = get_u32_le(header.data(), 0);
@@ -419,34 +513,44 @@ void MirrorListener::reader_loop(socket_t client) {
         if (payload_size > 0) {
             payload.resize(payload_size);
             n = recv_exact(client, payload.data(),
-                           static_cast<int>(payload_size), running_fn);
+                           static_cast<int>(payload_size), running_fn, last_rx, on_timeout, on_data);
             if (n == 0) { LOG_INFO << "mirror: iOS closed mid-payload"; break; }
+            if (n == -2) break;
             if (n < 0)  { LOG_WARN << "mirror: payload recv error";     break; }
         }
 
-        // Tag the moment the encrypted body finished arriving on the
-        // wire. Forwarded into the renderer so the status bar can
-        // surface end-to-end local-pipeline latency
-        // (decrypt + decode + render + present − this point).
         const int64_t origin_ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
 
         ++frames;
+        ++health_frames;
+        health_bytes += kHeaderSize + static_cast<uint64_t>(payload_size);
         total_header += kHeaderSize;
         total_body   += payload_size;
         counts[ftype]++;
         bytes_by_type[ftype] += payload_size;
+        switch (ftype) {
+            case kFrameVideoNonIdr: ++win_video; ++since_pic_video; break;
+            case kFrameVideoIdr:    ++win_video; ++win_idr; ++since_pic_video; break;
+            case kFrameSpsPps:      ++win_cfg;    ++since_pic_other; break;
+            case kFrameHeartbeat:   ++win_hb;     ++since_pic_other; break;
+            case kFrameStreamReport:++win_report; ++since_pic_other; break;
+            default:                ++win_other;  ++since_pic_other; break;
+        }
 
-        // Surface the encrypted-frame body byte count to the renderer
-        // so the status bar can report a live mirror bandwidth without
-        // the renderer needing to peek into us.
         if (renderer_) {
             renderer_->record_payload_bytes(
                 kHeaderSize + static_cast<std::size_t>(payload_size));
         }
 
-        // Verbose: first 5 frames regardless of type, plus every IDR/SPS_PPS.
+        if (ftype != kFrameVideoNonIdr && ftype != kFrameVideoIdr &&
+            ftype != kFrameSpsPps && ftype != kFrameHeartbeat &&
+            ftype != kFrameStreamReport && payload_size > 0 && unknown_types++ < 5) {
+            LOG_WARN << "mirror: unrecognised frame type 0x" << std::hex << ftype
+                     << std::dec << " (" << payload_size << " B) ignored";
+        }
+
         const bool verbose = (frames <= 5)
                           || (ftype == kFrameVideoIdr)
                           || (ftype == kFrameSpsPps);
@@ -458,9 +562,6 @@ void MirrorListener::reader_loop(socket_t client) {
                      << "  ts=" << ts;
         }
 
-        // On the first SPS/PPS frame, log the raw bytes + human-readable
-        // video characteristics. Every SPS/PPS (initial and resolution
-        // changes) is forwarded to the decoder.
         if (ftype == kFrameSpsPps && !payload.empty()) {
             if (counts[kFrameSpsPps] == 1) {
                 LOG_INFO << "mirror SPS/PPS hex: "
@@ -473,18 +574,12 @@ void MirrorListener::reader_loop(socket_t client) {
             }
         }
 
-        // Encrypted frames (IDR + non-IDR): AES-CTR-decrypt in place, then
-        // split the resulting cleartext AVCC stream into individual NAL
-        // units while converting to Annex-B (start-code-prefixed).
         const bool encrypted = (ftype == kFrameVideoIdr ||
                                 ftype == kFrameVideoNonIdr);
-        if (encrypted && decrypt_ && payload_size >= 5) {
+        if (encrypted && decrypt_ && payload_size > 0) {
             if (!decrypt_->decrypt(payload.data(), static_cast<int>(payload_size))) {
                 LOG_WARN << "mirror: AES-CTR decrypt failed on frame " << frames;
             } else {
-                // Pick the right NAL-header layout based on which codec
-                // the SPS/PPS frame configured. is_hevc() flips after
-                // set_parameter_sets_from_avcc parses an hvcC blob.
                 const NalCodec nal_codec =
                     (decoder_ && decoder_->is_hevc()) ? NalCodec::HEVC
                                                       : NalCodec::H264;
@@ -493,17 +588,17 @@ void MirrorListener::reader_loop(socket_t client) {
                     payload.data(), payload_size, nals, nal_codec);
 
                 if (!ok) {
+                    ++malformed_frames;
                     LOG_WARN << "mirror frame[" << frames << "]: malformed NAL "
                                 "stream after decrypt ("
                              << nals.size() << " NAL(s) parsed before stopping)";
                 } else {
                     for (const auto& nal : nals) nal_counts[nal.type]++;
-                    // Verbose: first IDR, first non-IDR, and any multi-NAL frame.
                     const bool first_of_kind = (counts[ftype] == 1);
                     const bool multi_nal     = (nals.size() > 1);
                     if (first_of_kind || multi_nal) {
                         LOG_INFO << "mirror frame[" << frames << "] "
-                                 << frame_name(ftype) << " → "
+                                 << frame_name(ftype) << " -> "
                                  << nals.size() << " NAL(s):";
                         for (const auto& nal : nals) {
                             LOG_INFO << "  NAL "
@@ -514,15 +609,19 @@ void MirrorListener::reader_loop(socket_t client) {
                         }
                     }
 
-                    // Feed the Annex-B NAL bytes to libavcodec. The payload is
-                    // already in Annex-B form after parse_nals_avcc_to_annexb.
                     if (decoder_) {
                         const bool is_idr = (ftype == kFrameVideoIdr);
                         bool got_frame = false;
                         int  dw = 0, dh = 0;
                         decoder_->decode(payload.data(), payload_size, is_idr,
                                          got_frame, dw, dh);
+                        if (renderer_ && decoder_->using_hardware() &&
+                            renderer_->gpu_convert_failures() >= kGpuConvertFailuresBeforeFallback) {
+                            decoder_->fallback_to_software("GPU frame conversion keeps failing");
+                            renderer_->reset_gpu_convert_failures();
+                        }
                         if (got_frame) {
+                            decoded_frames_.fetch_add(1, std::memory_order_relaxed);
                             if (decoder_->frames_decoded() == 1) {
                                 LOG_INFO << "decoded first frame: "
                                          << dw << 'x' << dh;
@@ -532,8 +631,6 @@ void MirrorListener::reader_loop(socket_t client) {
                                          << " frames (" << dw << 'x' << dh << ')';
                             }
 
-                            // Share a ref to the decoded frame: CPU planes
-                            // for software, resident D3D11 surfaces for GPU.
                             if (renderer_) {
                                 if (const AVFrame* af = decoder_->current_avframe()) {
                                     renderer_->push_avframe(af, origin_ns);
@@ -545,13 +642,16 @@ void MirrorListener::reader_loop(socket_t client) {
             }
         }
 
+        health();
+        video_watch();
+
         if ((frames % 500) == 0) {
             LOG_INFO << "mirror progress: " << frames << " frames, "
                      << (total_header + total_body) / 1024 << " KB total";
         }
     }
 
-    LOG_INFO << "mirror stream ended: " << frames << " frames"
+    LOG_NOTICE << "mirror stream ended: " << frames << " frames"
              << ", " << total_body << " payload bytes, per-type:";
     for (const auto& [t, c] : counts) {
         LOG_INFO << "  " << frame_name(t) << " (0x" << std::hex << t << std::dec
@@ -561,7 +661,7 @@ void MirrorListener::reader_loop(socket_t client) {
         const NalCodec final_codec =
             (decoder_ && decoder_->is_hevc()) ? NalCodec::HEVC
                                               : NalCodec::H264;
-        LOG_INFO << "NAL units decoded (after decrypt + AVCC→Annex-B):";
+        LOG_INFO << "NAL units decoded (after decrypt + AVCC->Annex-B):";
         for (const auto& [t, c] : nal_counts) {
             LOG_INFO << "  " << nal_type_name(t, final_codec)
                      << " (type=" << t << "): "

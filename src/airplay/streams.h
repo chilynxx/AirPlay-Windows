@@ -29,17 +29,7 @@ struct StreamChannel {
     socket_t control_sock  = INVALID_SOCK;
 };
 
-// Owns every UDP socket bound on behalf of one TCP session. Two entry
-// points:
-//
-//   - setup_legacy()     : old RTSP form with Transport header (keeps our
-//                          Python test suite green).
-//   - setup_session()    : AirPlay 2 first-round SETUP — binds a single
-//                          event + timing pair.
-//   - setup_stream()     : AirPlay 2 per-stream SETUP — binds data + ctrl.
-//
-// Lifetime: from first SETUP to TEARDOWN (or socket close). Destruction
-// closes every socket.
+// Owns every UDP socket bound on behalf of one TCP session.
 class StreamSession {
 public:
     StreamSession();
@@ -55,12 +45,6 @@ public:
     bool setup_legacy(const std::string& transport_header, StreamPorts& allocated);
     bool setup_session(uint16_t& event_port, uint16_t& timing_port);
 
-    // Per-stream setup options.
-    //   Type 110 (mirror video, TCP): aes_key + stream_connection_id drive
-    //     the AES-CTR decryption of the H.264 NAL payloads.
-    //   Type 96 (audio, UDP):         aes_key + aes_iv feed the AES-CBC
-    //     decryptor; ct + sample_rate select the codec used by the
-    //     downstream decoder.
     struct StreamOpts {
         std::vector<unsigned char> aes_key;
         std::vector<unsigned char> aes_iv;
@@ -73,10 +57,6 @@ public:
     bool setup_stream(int type, uint16_t& data_port, uint16_t& control_port,
                       const StreamOpts& opts);
 
-    // Start the NTP client thread that polls iOS's timing server at
-    // (remote_ip, remote_port) from our timing socket bound by setup_session().
-    // Must be called AFTER setup_session and before iOS gives up on the
-    // session (~8 sec).
     bool start_ntp(const std::string& remote_ip, uint16_t remote_port);
 
     // Partial teardown for AirPlay 2 stream-level TEARDOWN requests.
@@ -88,20 +68,22 @@ public:
     void resume_audio();
     void set_audio_track(const std::string& track);
 
+    // Request an immediate decoder keyframe resync on the active mirror listener.
+    void request_keyframe_resync() {
+        if (mirror_) mirror_->request_keyframe_resync();
+    }
+
     void teardown();
     bool audio_only() const;
-    bool media_control_active() const { return audio_only() || mirror_ != nullptr; }
 
     const std::string& session_id() const { return session_id_; }
 
 private:
-    // Legacy path state (used by the RTSP-Transport path).
     StreamPorts client_ports_{};
     socket_t    data_sock_   = INVALID_SOCK;
     socket_t    ctrl_sock_   = INVALID_SOCK;
     socket_t    timing_sock_ = INVALID_SOCK;
 
-    // AirPlay 2 path state.
     socket_t    event_sock_     = INVALID_SOCK;
     socket_t    ap2_timing_sock = INVALID_SOCK;
     std::vector<StreamChannel>                    channels_;   // audio streams (UDP)
@@ -109,8 +91,6 @@ private:
     std::unique_ptr<NtpClient>                    ntp_;
     std::unique_ptr<ap::audio::AudioReceiver>     audio_;      // type 96 UDP
     ap::video::VideoRenderer*                     renderer_{nullptr};
-    // A sender may release type 96 during pause without ending this session.
-    // DACP must remain usable to ask it to recreate the audio stream.
     bool audio_control_session_ = false;
     ap::audio::AudioReceiver::PauseState paused_audio_;
     std::string audio_track_;

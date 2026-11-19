@@ -95,7 +95,7 @@ bool entries(INetFwRules* rules, const std::wstring& path, std::vector<Entry>& r
         const HRESULT interfaces_result=rule->get_Interfaces(&restricted_interfaces);
         const bool all_interfaces=SUCCEEDED(interfaces_result) && (restricted_interfaces.vt==VT_EMPTY || restricted_interfaces.vt==VT_NULL);
         VariantClear(&restricted_interfaces);
-        // AirPlay negotiates dynamic TCP and UDP ports. A narrow port rule is insufficient.
+        // WinAirPlay negotiates dynamic TCP and UDP ports. A narrow port rule is insufficient.
         const bool coverage=have_ports && any(ports.text()) && have_scope && any(local.text()) &&
             (any(remote.text()) || normalized(remote.text())==L"localsubnet") && service.text().empty() &&
             (interfaces.text().empty() || normalized(interfaces.text())==L"all") && all_interfaces;
@@ -176,15 +176,15 @@ int configure_firewall() {
     // Stable per executable: moving the portable app must not alter a different copy's rule.
     uint64_t hash=14695981039346656037ull;
     for (wchar_t c : normalized(path)) { hash^=static_cast<uint64_t>(c); hash*=1099511628211ull; }
-    std::wostringstream label; label<<L"AirPlay Windows - "<<std::hex<<hash;
+    std::wostringstream label; label<<L"WinAirPlay - "<<std::hex<<hash;
     long allowed_profiles=profiles&7;
     for (const auto& entry : existing)
         if (entry.exact_app && !entry.model.block && entry.name==label.str())
             allowed_profiles|=static_cast<long>(entry.model.profiles&7);
     ComPtr<INetFwRule> rule;
     if (FAILED(CoCreateInstance(__uuidof(NetFwRule),nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(rule.GetAddressOf())))) return 5;
-    Bstr name(label.str().c_str()),app(path.c_str()),group(L"AirPlay Windows"),scope(L"LocalSubnet");
-    Bstr description(L"Allows AirPlay from devices on the local subnet for this executable and the selected network profiles.");
+    Bstr name(label.str().c_str()),app(path.c_str()),group(L"WinAirPlay"),scope(L"LocalSubnet");
+    Bstr description(L"Allows WinAirPlay from devices on the local subnet for this executable and the selected network profiles.");
     if (FAILED(rule->put_Name(name.value)) || FAILED(rule->put_Description(description.value)) ||
         FAILED(rule->put_ApplicationName(app.value)) || FAILED(rule->put_Grouping(group.value)) ||
         FAILED(rule->put_Protocol(NET_FW_IP_PROTOCOL_ANY)) || FAILED(rule->put_Direction(NET_FW_RULE_DIR_IN)) ||

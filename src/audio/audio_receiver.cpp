@@ -1,6 +1,8 @@
 #include "audio/audio_receiver.h"
 #include "airplay/ntp_client.h"
 #include "audio/rtp_flush.h"
+#include "audio/seq_dedup.h"
+#include "platform/thread_tuning.h"
 #include "log.h"
 #include "video/video_renderer.h"
 
@@ -8,6 +10,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iterator>
+#include <thread>
 
 #include <openssl/evp.h>
 
@@ -23,6 +26,16 @@ namespace ap::audio {
 namespace {
 
 constexpr int kRecvTimeoutMs = 200;
+
+// Mirror (unsynchronised) playback has no timestamp schedule, so anything that
+// stalls the pipeline for a moment (Wi-Fi burst, device hiccup, clock drift
+// between iPhone and sound card) used to leave that much extra audio queued
+// for the rest of the session. Beyond this much queued audio the backlog is
+// discarded once, so sound stays in step with the picture.
+constexpr int64_t kMaxUnsyncQueueNs = 300'000'000LL;
+// PCM is queued but the sound device has consumed nothing for this long:
+// reopen the device (sleeping Bluetooth/HDMI/USB endpoint, changed default).
+constexpr auto kDeviceStallTimeout = std::chrono::milliseconds(1500);
 
 void set_recv_timeout(socket_t s, int ms) {
 #if defined(_WIN32)
@@ -114,7 +127,7 @@ bool AudioReceiver::start(Config cfg, PauseState state) {
     synchronize_ = cfg_.synchronize && cfg_.ntp;
     playout_thread_ = std::thread(&AudioReceiver::playout_fn, this);
     thread_  = std::thread(&AudioReceiver::thread_fn, this);
-    LOG_INFO << "AudioReceiver listening (ct=" << cfg_.ct
+    LOG_NOTICE << "AudioReceiver listening (ct=" << cfg_.ct
              << ' ' << ct_name(cfg_.ct)
              << ", sample_rate=" << cfg_.sample_rate << ')';
     return true;
@@ -253,12 +266,13 @@ void AudioReceiver::thread_fn() {
     uint64_t hist_0_16 = 0, hist_17_64 = 0, hist_65_256 = 0,
              hist_257_512 = 0, hist_513_plus = 0;
 
-    // RAOP retransmits lost packets; iOS typically sends each seq 2-3 times
-    // for resilience. We keep a bitset of recently-seen seqs so the decoder
-    // only sees each audio frame once. seq is 16-bit — we use a 65 536-bit
-    // bitset via a boolean vector (8 KB).
-    std::vector<bool> seen_seq(65536, false);
-    std::optional<uint16_t> newest_sequence;
+    // iOS may send the same audio packet more than once. Keep a sliding
+    // window of recently seen sequence numbers so the decoder sees each
+    // frame once. (The previous fixed bitset was never cleaned up reliably
+    // and, after the 16-bit sequence wrapped, discarded fresh packets —
+    // audio faded out after 10-25 minutes.)
+    SeqDedupWindow dedup;
+    ap::platform::raise_current_thread_priority();
 
     // Silence watchdog: any valid RTP packet pushes the renderer to
     // "playing"; going idle for more than kSilencePauseMs pushes it to
@@ -279,7 +293,31 @@ void AudioReceiver::thread_fn() {
     bool audio_ever_seen = false;
     uint64_t sync_packets = 0;
 
+    // Health line every 10 s — written to the log file even without --log, so
+    // that after a dropout the log shows whether packets stopped arriving,
+    // were dropped as duplicates, or piled up in the sound device.
+    auto last_health = std::chrono::steady_clock::now();
+    uint64_t health_pkts0 = 0, health_dup0 = 0;
+
     while (running_.load()) {
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_health >= std::chrono::seconds(10)) {
+                const int64_t sink_ms = output_ ? output_->pending_ns() / 1'000'000 : 0;
+                LOG_NOTICE << "health: audio rx " << (pkts - health_pkts0)
+                           << " pkts in "
+                           << std::chrono::duration_cast<std::chrono::seconds>(now - last_health).count()
+                           << " s (dup dropped " << (dedup_dropped - health_dup0)
+                           << "), last packet "
+                           << std::chrono::duration_cast<std::chrono::milliseconds>(now - last_packet).count()
+                           << " ms ago, sink queue " << sink_ms << " ms"
+                           << ", trimmed=" << backlog_trimmed_.load()
+                           << " device_reopened=" << device_reopened_.load();
+                last_health   = now;
+                health_pkts0  = pkts;
+                health_dup0   = dedup_dropped;
+            }
+        }
         fd_set readable;
         FD_ZERO(&readable);
         FD_SET(cfg_.data_sock, &readable);
@@ -291,6 +329,12 @@ void AudioReceiver::thread_fn() {
         timeval timeout{0, kRecvTimeoutMs * 1000};
         const int ready = ::select(static_cast<int>(highest + 1), &readable, nullptr, nullptr, &timeout);
         if (!running_) break;
+        if (ready < 0) {
+            // A broken socket makes select() fail immediately; without a pause
+            // this loop would spin a CPU core at 100%.
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+        }
         if (ready > 0 && cfg_.control_sock != INVALID_SOCK &&
             FD_ISSET(cfg_.control_sock, &readable)) {
             unsigned char control[2048];
@@ -410,24 +454,9 @@ void AudioReceiver::thread_fn() {
         // overlapping seq values we don't want to blacklist.
         const bool real_audio = (payload_len >= 100);
         bool is_duplicate     = false;
-        if (real_audio) {
-            // Age history by sequence progress, including across 16-bit wrap.
-            // Packet-count cleanup can be skipped by duplicate arrivals.
-            constexpr uint16_t history = 8192;
-            if (newest_sequence) {
-                const uint16_t distance = static_cast<uint16_t>(seq - *newest_sequence);
-                if (distance && distance < 32768) {
-                    if (distance >= history) std::fill(seen_seq.begin(), seen_seq.end(), false);
-                    else for (uint16_t step = 1; step <= distance; ++step)
-                        seen_seq[static_cast<uint16_t>(*newest_sequence + step - history)] = false;
-                    newest_sequence = seq;
-                } else if (static_cast<uint16_t>(*newest_sequence - seq) >= history) {
-                    is_duplicate = true;
-                }
-            } else newest_sequence = seq;
-            is_duplicate = is_duplicate || seen_seq[seq];
-            if (is_duplicate) ++dedup_dropped;
-            else seen_seq[seq] = true;
+        if (real_audio && dedup.is_duplicate(seq)) {
+            is_duplicate = true;
+            ++dedup_dropped;
         }
 
         // Feed the real-audio (non-duplicate) frames to the AAC decoder,
@@ -540,7 +569,7 @@ void AudioReceiver::thread_fn() {
         }
     }
 
-    LOG_INFO << "AudioReceiver stopped (" << pkts << " pkts, "
+    LOG_NOTICE << "AudioReceiver stopped (" << pkts << " pkts, "
              << total_bytes << " payload bytes, "
              << dedup_dropped << " duplicate audio frames dropped, "
              << (decoder_ ? decoder_->frames_decoded() : 0)
@@ -565,11 +594,30 @@ void AudioReceiver::playout_fn() {
     bool fallback_logged = false;
     bool scheduled_logged = false;
     uint64_t played = 0, late_dropped = 0;
+    auto next_reopen_try = std::chrono::steady_clock::now();
+    ap::platform::raise_current_thread_priority();
     std::unique_lock<std::mutex> lock(pcm_mutex_);
     while (running_) {
         if (clear_output_) {
             if (output_) output_->clear();
             clear_output_ = false;
+        }
+        // Sound device watchdog: the device stopped consuming audio, or an
+        // earlier reopen could not get a device. The lock is released while
+        // reopening so the network thread keeps receiving. After a failure,
+        // wait a couple of seconds before trying again.
+        if (output_ && std::chrono::steady_clock::now() >= next_reopen_try &&
+            (!output_->is_open() || output_->stalled(kDeviceStallTimeout))) {
+            lock.unlock();
+            const bool ok = output_->reopen();
+            lock.lock();
+            const uint64_t reopened = ++device_reopened_;
+            if (reopened <= 5 || reopened % 20 == 0)
+                LOG_WARN << "Audio device reopened (" << (ok ? "ok" : "FAILED")
+                         << ") count=" << reopened;
+            next_reopen_try = std::chrono::steady_clock::now() +
+                              (ok ? std::chrono::milliseconds(0) : std::chrono::milliseconds(2000));
+            continue;
         }
         if (pcm_queue_.empty()) {
             pcm_cv_.wait_for(lock, std::chrono::milliseconds(20));
@@ -621,6 +669,15 @@ void AudioReceiver::playout_fn() {
                 LOG_WARN << "Audio late frames dropped=" << late_dropped
                          << " behind_ms=" << -advance / 1'000'000;
             continue;
+        }
+
+        // Unsynchronised (mirror) playback: keep the device queue short.
+        if (!synchronize_ && output_ && pending > kMaxUnsyncQueueNs) {
+            output_->clear();
+            const uint64_t trimmed = ++backlog_trimmed_;
+            if (trimmed == 1 || trimmed % 20 == 0)
+                LOG_WARN << "Audio backlog trimmed (" << pending / 1'000'000
+                         << " ms queued) count=" << trimmed;
         }
 
         auto frame = std::move(pcm_queue_.front());
