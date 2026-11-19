@@ -7,8 +7,8 @@
 namespace ap::audio {
 
 // The PC-side volume (slider and mute button in the window). It multiplies the
-// level the iPhone announced, so pressing the iPhone's volume buttons and moving
-// the slider in WWinAirPlay both change the loudness of the PC in real time.
+// level the device announced, so pressing the phone's volume buttons and moving
+// the slider in WinAirPlay both change the loudness of the PC in real time.
 // Process-wide and lock-free: the interface sets it, the audio thread reads it.
 class MasterVolume {
 public:

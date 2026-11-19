@@ -5,7 +5,7 @@
 
 namespace ap::platform {
 
-inline constexpr wchar_t kInstanceWindowProperty[] = L"AirPlay-Windows.MainWindow.v1";
+inline constexpr wchar_t kInstanceWindowProperty[] = L"WinAirPlay.MainWindow.v1";
 
 // Session-local kernel objects disappear automatically after the last process
 // closes them, including after a crash. The event also remembers an activation
@@ -16,10 +16,10 @@ public:
 
     Result acquire() {
         event_ = CreateEventW(nullptr, FALSE, FALSE,
-                              L"Local\\AirPlay-Windows.Activate.v1");
+                              L"Local\\WinAirPlay.Activate.v1");
         if (!event_) return Result::Error;
         mutex_ = CreateMutexW(nullptr, FALSE,
-                              L"Local\\AirPlay-Windows.Instance.v1");
+                              L"Local\\WinAirPlay.Instance.v1");
         const DWORD error = GetLastError();
         if (!mutex_) return Result::Error;
         if (error != ERROR_ALREADY_EXISTS) return Result::Primary;

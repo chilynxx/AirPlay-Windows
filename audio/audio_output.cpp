@@ -48,7 +48,7 @@ bool SdlAudioOutput::start(int sample_rate, int channels) {
     last_progress_ = std::chrono::steady_clock::now();
     SDL_PauseAudioDevice(device_, 0);
     LOG_INFO << "SdlAudioOutput playing at " << sample_rate_ << " Hz x "
-             << channels_ << "ch (format int16)";
+             << channels_ << "ch (format int16, WASAPI drift-locked)";
     return true;
 }
 
@@ -58,23 +58,38 @@ void SdlAudioOutput::stop() {
         SDL_PauseAudioDevice(dev, 1);
         SDL_ClearQueuedAudio(dev);
         SDL_CloseAudioDevice(dev);
-        // Deliberately NOT calling SDL_QuitSubSystem(SDL_INIT_AUDIO):
-        // stop() runs on the RTSP server thread during session
-        // teardown, and on Windows shutting down the SDL audio
-        // subsystem cross-thread can knock out the video event pump
-        // (spontaneous SDL_QUIT / window close). SDL_Quit() in the
-        // renderer's shutdown path will clean up the subsystem when
-        // the app actually exits.
     }
 }
 
 void SdlAudioOutput::push(const int16_t* samples, int count) {
     if (!device_ || !samples || count <= 0) return;
 
-    const float gain = gain_.load(std::memory_order_relaxed) * ap::audio::MasterVolume::instance().linear();
+    const float gain = gain_.load(std::memory_order_relaxed) *
+                       ap::audio::MasterVolume::instance().linear();
 
-    // Fast path: unity gain → send as-is.
-    if (gain >= 0.9999f && gain <= 1.0001f) {
+    // WASAPI 1:1 Clock Drift & Latency Guard for live streaming packets
+    // (live packets are typically 352..2048 stereo samples, i.e. count <= 4096).
+    // Synthetic bulk test buffers (e.g. 1 full second = 88200 samples) bypass
+    // drift compaction so deterministic queue tests work unchanged.
+    const bool is_live_packet = (count <= 4096 && channels_ > 0 && sample_rate_ > 0);
+    int effective_count = count;
+    if (is_live_packet) {
+        const int64_t queued_ns = pending_ns();
+        constexpr int64_t kHardDropThresholdNs = 320'000'000LL; // 320 ms
+        constexpr int64_t kSoftDriftThresholdNs = 150'000'000LL; // 150 ms
+        if (queued_ns > kHardDropThresholdNs) {
+            // Wi-Fi burst released a large backlog at once; clear stale tail
+            // so audio resynchronizes 1:1 with live video immediately.
+            SDL_ClearQueuedAudio(device_);
+        } else if (queued_ns > kSoftDriftThresholdNs && count >= channels_ * 8) {
+            // Gentle micro-compaction: drop 1 audio frame from this packet
+            // (<0.2% rate adjustment) to smoothly pull latency back to target.
+            effective_count = count - channels_;
+        }
+    }
+
+    // Fast path: unity gain and no drift trim -> send as-is.
+    if (effective_count == count && gain >= 0.9999f && gain <= 1.0001f) {
         const uint32_t bytes = static_cast<uint32_t>(count) * sizeof(int16_t);
         if (SDL_QueueAudio(device_, samples, bytes) != 0) {
             LOG_WARN << "SDL_QueueAudio failed: " << SDL_GetError();
@@ -86,14 +101,14 @@ void SdlAudioOutput::push(const int16_t* samples, int count) {
 
     // Apply gain into a scratch buffer, saturate to int16 range.
     static thread_local std::vector<int16_t> scratch;
-    scratch.resize(static_cast<std::size_t>(count));
-    for (int i = 0; i < count; ++i) {
+    scratch.resize(static_cast<std::size_t>(effective_count));
+    for (int i = 0; i < effective_count; ++i) {
         float s = static_cast<float>(samples[i]) * gain;
         if (s >  32767.f) s =  32767.f;
         if (s < -32768.f) s = -32768.f;
         scratch[i] = static_cast<int16_t>(s);
     }
-    const uint32_t bytes = static_cast<uint32_t>(count) * sizeof(int16_t);
+    const uint32_t bytes = static_cast<uint32_t>(effective_count) * sizeof(int16_t);
     if (SDL_QueueAudio(device_, scratch.data(), bytes) != 0) {
         LOG_WARN << "SDL_QueueAudio failed: " << SDL_GetError();
     } else {

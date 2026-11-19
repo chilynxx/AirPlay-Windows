@@ -29,14 +29,11 @@ namespace ap::airplay {
 //   [128..]  payload (NAL units: encrypted H.264 or clear SPS/PPS)
 //
 // payload_type values (first 2 bytes at offset 4..5):
-//   0x00 0x00 → AES-CTR encrypted VCL NAL type 1 (non-IDR video frame)
-//   0x00 0x10 → AES-CTR encrypted VCL NAL type 5 (IDR keyframe)
-//   0x01 0x00 → CLEAR SPS + PPS (types 7 + 8), sent at init and format changes
-//   0x02 0x00 → old-protocol heartbeat, no payload
-//   0x05 0x00 → "streaming report" (once per second, no video)
-//
-// For now we parse, count, and log. Decryption + H.264 decode is the next
-// milestone (needs playfair for the AES key).
+//   0x00 0x00 -> AES-CTR encrypted VCL NAL type 1 (non-IDR video frame)
+//   0x00 0x10 -> AES-CTR encrypted VCL NAL type 5 (IDR keyframe)
+//   0x01 0x00 -> CLEAR SPS + PPS (types 7 + 8), sent at init and format changes
+//   0x02 0x00 -> old-protocol heartbeat, no payload
+//   0x05 0x00 -> "streaming report" (once per second, no video)
 class MirrorListener {
 public:
     MirrorListener();
@@ -61,6 +58,12 @@ public:
     // Attach an external renderer — decoded frames (YUV420P) are pushed to
     // it on the reader thread. The listener does not own the renderer.
     void attach_renderer(ap::video::VideoRenderer* renderer) { renderer_ = renderer; }
+
+    // Request an immediate decoder reference-frame flush and IDR resync
+    // without dropping the active TCP stream. Thread-safe.
+    void request_keyframe_resync() {
+        idr_resync_requested_.store(true, std::memory_order_release);
+    }
 
     // How long the sender may stay completely silent before the stream is
     // closed (default 30 s). Adjustable mainly for tests.
@@ -93,6 +96,7 @@ private:
     std::atomic<int64_t>                       health_period_ms_{10'000};
     std::atomic<int64_t>                       stall_warn_ms_{20'000};
     std::atomic<uint64_t>                      decoded_frames_{0};
+    std::atomic<bool>                          idr_resync_requested_{false};
 };
 
 } // namespace ap::airplay

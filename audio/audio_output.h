@@ -10,10 +10,8 @@ namespace ap::audio {
 // PulseAudio on Linux). The producer calls push() with interleaved int16
 // samples; SDL handles pacing and delivers them to the OS mixer.
 //
-// We don't use SDL's callback pull mode because the producer cadence
-// (decoder output) is already naturally paced by the network, and the
-// queue lets us absorb short bursts cleanly without locking the
-// decoder thread on audio hardware.
+// Includes an adaptive WASAPI 1:1 clock-drift stabilizer that prevents
+// multi-hour audio drift or post-stutter queue buildup during live packets.
 class SdlAudioOutput {
 public:
     SdlAudioOutput();
