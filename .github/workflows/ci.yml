@@ -1,18 +1,10 @@
 name: CI
 
-# Continuous integration build + test. Fires on:
-#   - every push to main (catches breakage in your own commits)
-#   - every pull request (gives reviewers a green/red signal)
-# Releases live in release.yml (separate workflow, fires on tag push)
-# so the CI run stays fast and never produces release artifacts.
-
 on:
   push:
     branches: [main]
   pull_request:
 
-# Auto-cancel an in-progress CI run if a newer commit lands on the
-# same branch / PR - no point burning runner minutes on stale code.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -23,6 +15,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up Python for source preflight
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Verify source tree before dependency installation
+        run: python tools/check_sources.py
 
       - name: Read vcpkg baseline from manifest
         id: vcpkg
@@ -50,6 +50,7 @@ jobs:
           cmake -S . -B build `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DBUILD_NETWORK_TESTS=ON `
+            -DBUILD_STABILITY_TESTS=ON `
             -G "Visual Studio 18 2026" -A x64
 
       - name: Build Release
@@ -58,10 +59,6 @@ jobs:
       - name: Run socket lifecycle regression tests
         run: ctest --test-dir build -C Release --output-on-failure
 
-      # Python role-plays an iOS client for 6 scenarios (pair-verify
-      # round-trip, real iOS headers, signature corruption, concurrent
-      # sessions, fp-setup framing, legacy ANNOUNCE/SETUP/RECORD/
-      # TEARDOWN). Catches handshake regressions without an iPhone.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -70,27 +67,19 @@ jobs:
       - name: Install Python deps
         run: pip install cryptography
 
-      # Integration test: the Python harness expects a live AirPlay
-      # server on 127.0.0.1:7000. Start the binary in the background,
-      # poll for the listener, run the test, then teardown. SDL's
-      # dummy drivers keep video / audio init happy on a runner that
-      # has no interactive desktop / audio device.
       - name: Run pair-verify protocol tests
         shell: pwsh
         run: |
           $env:SDL_VIDEODRIVER = "dummy"
           $env:SDL_AUDIODRIVER = "dummy"
           $proc = Start-Process `
-            -FilePath "build\Release\airplay-windows.exe" `
+            -FilePath "build\Release\WinAirPlay.exe" `
             -ArgumentList "--log" `
             -WindowStyle Hidden `
             -PassThru `
             -RedirectStandardOutput "airplay.stdout.log" `
             -RedirectStandardError "airplay.stderr.log"
 
-          # Poll the listener for up to 15 s rather than a blind sleep:
-          # vcpkg-built FFmpeg cold-init + SDL sometimes takes 2-3 s
-          # extra on a fresh runner.
           $ready = $false
           for ($i = 0; $i -lt 30; $i++) {
             try {
@@ -125,3 +114,60 @@ jobs:
           if (Test-Path airplay.stderr.log) { Get-Content airplay.stderr.log -Tail 80 }
 
           exit $testCode
+
+      - name: Package full WinAirPlay source snapshot
+        if: success()
+        shell: pwsh
+        run: |
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $sourceZip = "WinAirPlay-source-$shortSha.zip"
+          git archive --format=zip --prefix=WinAirPlay/ HEAD -o $sourceZip
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $sourceZip)) {
+            throw "Failed to create complete source archive from the checked-out commit."
+          }
+          $sourceHash = (Get-FileHash -LiteralPath $sourceZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$sourceHash  $sourceZip" | Set-Content -Path "$sourceZip.sha256" -Encoding ascii
+          "WIN_AIRPLAY_SOURCE_ZIP=$sourceZip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Created full source snapshot: $sourceZip"
+
+      - name: Package WinAirPlay test build
+        if: success()
+        shell: pwsh
+        run: |
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $zipName = "WinAirPlay-test-$shortSha-x64.zip"
+          $packageDir = Join-Path $env:RUNNER_TEMP "WinAirPlay-test-$shortSha"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+
+          $exe = "build\Release\WinAirPlay.exe"
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Build output not found: $exe"
+          }
+          Copy-Item -LiteralPath $exe -Destination $packageDir
+
+          $dlls = @(Get-ChildItem build\Release -Filter *.dll -File)
+          foreach ($dll in $dlls) {
+            Copy-Item -LiteralPath $dll.FullName -Destination $packageDir
+          }
+
+          Copy-Item -LiteralPath README.md, LICENSE, THIRD_PARTY_NOTICES.md -Destination $packageDir
+          Copy-Item -LiteralPath docs -Destination $packageDir -Recurse
+          Compress-Archive -Path "$packageDir\*" -DestinationPath $zipName -Force
+
+          $hash = (Get-FileHash -LiteralPath $zipName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $zipName" | Set-Content -Path "$zipName.sha256" -Encoding ascii
+          "WIN_AIRPLAY_ZIP=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Packaged $zipName with $($dlls.Count) runtime DLL(s)."
+
+      - name: Upload WinAirPlay test package
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinAirPlay-test-${{ github.sha }}
+          path: |
+            ${{ env.WIN_AIRPLAY_ZIP }}
+            ${{ env.WIN_AIRPLAY_ZIP }}.sha256
+            ${{ env.WIN_AIRPLAY_SOURCE_ZIP }}
+            ${{ env.WIN_AIRPLAY_SOURCE_ZIP }}.sha256
+          if-no-files-found: error
+          retention-days: 30
