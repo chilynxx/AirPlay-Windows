@@ -480,7 +480,7 @@ void AndroidMirrorServer::stream_worker(socket_t client,
 
     std::vector<uint8_t> cached_sps;
     std::vector<uint8_t> cached_pps;
-    int last_sps_w = 0, last_sps_h = 0;
+    uint32_t last_sps_w = 0, last_sps_h = 0;
 
     auto feed_annexb_nal = [&](const uint8_t* nal_with_sc, std::size_t total_len,
                                const uint8_t* raw_nal, std::size_t raw_len,
